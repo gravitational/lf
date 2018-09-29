@@ -66,7 +66,6 @@ func (s *ContainerSuite) TestMarshalUnmarshal(c *check.C) {
 			c.Assert(err, check.NotNil, comment)
 			c.Assert(tc.err, check.FitsTypeOf, err, comment)
 		} else {
-			//c.Assert(data, check.DeepEquals, tc.out, comment)
 			length, err := m.Unmarshal(out, data)
 			c.Assert(err, check.IsNil, comment)
 			c.Assert(length, check.Equals, len(tc.in))

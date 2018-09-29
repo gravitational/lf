@@ -1,0 +1,27 @@
+PROTOC_VER ?= 3.6.1
+GOGO_PROTO_TAG ?= v1.1.1
+PLATFORM := linux-x86_64
+BUILDBOX_TAG := gravitationallf
+
+# buildbox builds docker buildbox image used to compile binaries and generate GRPc stuff
+.PHONY: buildbox
+buildbox:
+	docker build \
+          --build-arg PROTOC_VER=$(PROTOC_VER) \
+          --build-arg GOGO_PROTO_TAG=$(GOGO_PROTO_TAG) \
+          --build-arg PLATFORM=$(PLATFORM) \
+          -t $(BUILDBOX_TAG) .
+
+# gen generates protobuf
+.PHONY: gen
+gen: buildbox
+	docker run -v $(shell pwd):/go/src/github.com/gravitational/lf $(BUILDBOX_TAG) make -C /go/src/github.com/gravitational/lf buildbox-gen
+
+# gen generates definitions from proto files,
+# is run inside the buildbox
+.PHONY: buildbox-gen
+buildbox-gen:
+# standard GRPC output
+	echo $$PROTO_INCLUDE
+	cd walpb && protoc --gogofast_out=. -I=.:$$PROTO_INCLUDE *.proto
+

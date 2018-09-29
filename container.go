@@ -124,9 +124,10 @@ type DataCorruptionError struct {
 	ComputedChecksum uint32
 }
 
-// Error is error message of the error
+// Error returns a formatted user-friendly message
 func (e DataCorruptionError) Error() string {
-	return fmt.Sprintf("checksum mismatch, expected checksum %v != computed checksum %v", e.ExpectedChecksum, e.ComputedChecksum)
+	return fmt.Sprintf("checksum mismatch, expected checksum %v != computed checksum %v",
+		e.ExpectedChecksum, e.ComputedChecksum)
 }
 
 // IsDataCorruptionError returns true if given error is data corruption error
@@ -136,25 +137,40 @@ func IsDataCorruptionError(e error) bool {
 }
 
 // ContainerMarshalString is a utility function to marshal string of bytes
-// to log container, used in tests, because it's not efficient
+// to a log container
 func ContainerMarshalString(in string) ([]byte, error) {
+	return ContainerMarshal([]byte(in))
+}
+
+// ContainerUnmarshalString is a utility function to unmarshal string of bytes
+// from a marshaled container
+func ContainerUnmarshalString(in []byte) (string, error) {
+	out, err := ContainerUnmarshal(in)
+	if err != nil {
+		return "", trace.Wrap(err)
+	}
+	return string(out), nil
+}
+
+// ContainerMarshal is a utility function to marshal a slice of bytes
+// to a log container
+func ContainerMarshal(in []byte) ([]byte, error) {
 	m := NewContainerMarshaler()
 	out := make([]byte, ContainerSizeBytes)
-	if err := m.Marshal(out, []byte(in)); err != nil {
+	if err := m.Marshal(out, in); err != nil {
 		return nil, trace.Wrap(err)
 	}
 	return out, nil
 }
 
-// ContainerUnmarshalString is a utility function to unmarshal string of bytes
-// from marshaled container,
-// to be used in tests, because its not very efficient
-func ContainerUnmarshalString(in []byte) (string, error) {
+// ContainerUnmarshal is a utility function to unmarshal a slice of bytes
+// from a marshaled container
+func ContainerUnmarshal(in []byte) ([]byte, error) {
 	out := make([]byte, ContainerSizeBytes)
 	m := NewContainerMarshaler()
 	length, err := m.Unmarshal(out, in)
 	if err != nil {
-		return "", trace.Wrap(err)
+		return nil, trace.Wrap(err)
 	}
-	return string(out[:length]), nil
+	return out[:length], nil
 }

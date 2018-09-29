@@ -1,0 +1,46 @@
+syntax = "proto2";
+package walpb;
+
+import "gogoproto/gogo.proto";
+
+option (gogoproto.marshaler_all) = true;
+option (gogoproto.sizer_all) = true;
+option (gogoproto.unmarshaler_all) = true;
+option (gogoproto.goproto_getters_all) = false;
+
+// Operation
+enum Operation {
+  CREATE = 0;
+  UPDATE = 1;
+  PUT    = 2;
+  DELETE = 3;
+}
+
+message Record {
+    // ProcessID identifies different processes writing
+    // to the log, processes have to increase monotonically
+    // and be different for different processes writing
+    // to the same file to preserve integrity
+	required uint64 ProcessID    =  1 [(gogoproto.nullable) = false];
+    // ID is a record ID that is monothonically incremented by each process
+    // Several records have the same id if they carry on the value split
+    // into multiple containers, ID is monothonically incremented by each process.
+	required uint64 ID           =  2 [(gogoproto.nullable) = false];
+    // PartID is used to identify a part index (starting from 0)
+    // in a multi-part record, subsequent parts have incremental
+    // ids (0, 1, 2, 3 ...)
+    // Together, (ProcessID, ID, PartID) form a unique
+    // position index 3-tuple in a log.
+    required int32 PartID    =  3 [(gogoproto.nullable) = false];
+    // LastPart is false when record is split into multiple parts
+    // and this is not the last part, true if this is a last record
+    // of the multi-part record. If PartID is 0 and LastPart is true
+    // it means that this is a single part record.
+    required bool LastPart = 4  [(gogoproto.nullable) = false];
+    // Operation defines operation type
+    required Operation Operation =  5 [(gogoproto.nullable) = false];
+    // Key is the key in the key value tuple being created, updated or deleted
+	required bytes  Key          =  6;
+    // Val is set for all operations except DELETE
+	optional bytes  Val          =  7;
+}
