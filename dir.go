@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
-	"fmt"
 	"io"
 	"io/ioutil"
 	"math"
@@ -196,12 +195,15 @@ func (d *DirLog) Get(key string) ([]byte, error) {
 	}
 	val, ok := d.kv[key]
 	if !ok {
-		return nil, trace.NotFound("%v is not found", key)
+		return nil, trace.NotFound("key is not found")
 	}
 	return val, nil
 }
 
 func (d *DirLog) Append(ctx context.Context, r Record) error {
+	if err := r.CheckAndSetDefaults(); err != nil {
+		return trace.Wrap(err)
+	}
 	// grab a lock, read and seek to the end of file and sync up the state
 	if err := fs.WriteLock(d.file); err != nil {
 		return trace.Wrap(err)
@@ -263,7 +265,6 @@ func (d *DirLog) split(src Record) (*walpb.Record, []walpb.Record, error) {
 	partID := int32(-1)
 	for {
 		partID += 1
-		fmt.Printf("part id: %v key: %v, val: %v\n", partID, len(r.Key), len(r.Val))
 		// fail safe check, 1K parts is 20MB record
 		if partID > 5000 {
 			return nil, nil, trace.BadParameter("record is too large")
@@ -351,10 +352,6 @@ func (m *recordMarshaler) takeRecord() *walpb.Record {
 	return r
 }
 
-func (m *recordMarshaler) hasRecord() bool {
-	return m.current != nil
-}
-
 func (m *recordMarshaler) accept(data []byte) error {
 	var r walpb.Record
 	if err := r.Unmarshal(data); err != nil {
@@ -383,6 +380,7 @@ func (m *recordMarshaler) accept(data []byte) error {
 		m.current.Val = append(m.current.Val, r.Val...)
 	}
 	m.current.PartID = r.PartID
+	m.current.LastPart = r.LastPart
 	return nil
 }
 

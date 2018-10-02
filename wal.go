@@ -42,6 +42,18 @@ type Record struct {
 	Val []byte
 }
 
+// CheckAndSetDefaults checks record values
+func (r *Record) CheckAndSetDefaults() error {
+	_, err := r.Type.Operation()
+	if err != nil {
+		return trace.Wrap(err)
+	}
+	if len(r.Key) == 0 {
+		return trace.BadParameter("missing parameter key")
+	}
+	return nil
+}
+
 // Log is operation log, it serializes
 // operations to the external storage and reads them
 type Log interface {

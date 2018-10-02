@@ -17,8 +17,10 @@ limitations under the License.
 package lf
 
 import (
+	"bytes"
 	"context"
 
+	"github.com/gravitational/trace"
 	check "gopkg.in/check.v1"
 )
 
@@ -65,11 +67,35 @@ func (s *DirSuite) TestConcurrentCRUD(c *check.C) {
 	out, err = l.Get("another")
 	c.Assert(err, check.IsNil)
 	c.Assert(out, check.DeepEquals, []byte("record"))
+
+	// update existing record
+	err = l.Append(context.TODO(),
+		Record{Type: OpUpdate, Key: []byte("another"), Val: []byte("value 2")})
+	c.Assert(err, check.IsNil)
+
+	out, err = l.Get("another")
+	c.Assert(err, check.IsNil)
+	c.Assert(out, check.DeepEquals, []byte("value 2"))
+
+	out, err = l2.Get("another")
+	c.Assert(err, check.IsNil)
+	c.Assert(out, check.DeepEquals, []byte("value 2"))
+
+	// delete a record
+	err = l.Append(context.TODO(),
+		Record{Type: OpDelete, Key: []byte("another")})
+	c.Assert(err, check.IsNil)
+
+	_, err = l.Get("another")
+	c.Assert(trace.IsNotFound(err), check.Equals, true)
+
+	_, err = l2.Get("another")
+	c.Assert(trace.IsNotFound(err), check.Equals, true)
 }
 
 // TestLargeRecord tests scenario
-// when large record is marshaled
-func (s *DirSuite) TestLargeRecord(c *check.C) {
+// when large record is marshaled and unmarshaled
+func (s *DirSuite) recordSizes(c *check.C, keySize, valSize int) error {
 	dir := c.MkDir()
 	l, err := NewDirLog(DirLogConfig{
 		Dir: dir,
@@ -78,8 +104,8 @@ func (s *DirSuite) TestLargeRecord(c *check.C) {
 	defer l.Close()
 
 	r := Record{Type: OpCreate}
-	r.Key = make([]byte, ContainerSizeBytes+2)
-	r.Val = make([]byte, ContainerSizeBytes+15)
+	r.Key = make([]byte, keySize)
+	r.Val = make([]byte, valSize)
 	for i := 0; i < len(r.Key); i++ {
 		r.Key[i] = byte(i % 255)
 	}
@@ -88,15 +114,79 @@ func (s *DirSuite) TestLargeRecord(c *check.C) {
 	}
 
 	err = l.Append(context.TODO(), r)
-	c.Assert(err, check.IsNil)
+	if err != nil {
+		return trace.Wrap(err)
+	}
 
 	l2, err := NewDirLog(DirLogConfig{
 		Dir: dir,
 	})
-	c.Assert(err, check.IsNil)
+	if err != nil {
+		return trace.Wrap(err)
+	}
 	defer l2.Close()
 
 	out, err := l2.Get(string(r.Key))
-	c.Assert(err, check.IsNil)
-	c.Assert(out, check.DeepEquals, r.Val)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+	if !bytes.Equal(out, r.Val) {
+		return trace.CompareFailed("%v != %v", len(r.Val), len(out))
+	}
+	return nil
+}
+
+// TestRecords tests records of various key and value sizes
+func (s *DirSuite) TestRecords(c *check.C) {
+	type testCase struct {
+		info    string
+		keySize int
+		valSize int
+		err     error
+	}
+	testCases := []testCase{
+		{
+			info:    "both keys and vals exceed container size",
+			keySize: ContainerSizeBytes + 2,
+			valSize: ContainerSizeBytes + 15,
+		},
+		{
+			info:    "key is on the boundary",
+			keySize: ContainerSizeBytes - headerSizeBytes,
+			valSize: ContainerSizeBytes,
+		},
+		{
+			info:    "key val is on the boundary",
+			keySize: ContainerSizeBytes - headerSizeBytes,
+			valSize: ContainerSizeBytes - headerSizeBytes,
+		},
+		{
+			info:    "key val is almost the boundary",
+			keySize: ContainerSizeBytes - headerSizeBytes - 1,
+			valSize: ContainerSizeBytes - headerSizeBytes - 1,
+		},
+		{
+			info:    "key val exceed the boundary",
+			keySize: ContainerSizeBytes - headerSizeBytes + 1,
+			valSize: ContainerSizeBytes - headerSizeBytes + 1,
+		},
+		{
+			info:    "zero keys are not allowed",
+			keySize: 0,
+			valSize: ContainerSizeBytes,
+			err:     trace.BadParameter("bad parameter"),
+		},
+	}
+	for i, tc := range testCases {
+		comment := check.Commentf("test case %v: %q", i, tc.info)
+		err := s.recordSizes(c, tc.keySize, tc.valSize)
+		if tc.err != nil {
+			c.Assert(err, check.FitsTypeOf, tc.err)
+
+		} else {
+			if err != nil {
+				c.Assert(err, check.IsNil, comment)
+			}
+		}
+	}
 }
