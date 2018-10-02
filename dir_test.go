@@ -176,6 +176,11 @@ func (s *DirSuite) TestRecords(c *check.C) {
 			valSize: ContainerSizeBytes,
 			err:     trace.BadParameter("bad parameter"),
 		},
+		{
+			info:    "zero values are not ok",
+			keySize: 5,
+			valSize: 0,
+		},
 	}
 	for i, tc := range testCases {
 		comment := check.Commentf("test case %v: %q", i, tc.info)
