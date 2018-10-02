@@ -40,7 +40,7 @@ message Record {
     // Operation defines operation type
     required Operation Operation =  5 [(gogoproto.nullable) = false];
     // Key is the key in the key value tuple being created, updated or deleted
-	required bytes  Key          =  6;
+	optional bytes  Key          =  6;
     // Val is set for all operations except DELETE
 	optional bytes  Val          =  7;
 }

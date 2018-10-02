@@ -2,9 +2,28 @@ package lf
 
 import (
 	"context"
+
+	"github.com/gravitational/lf/walpb"
+
+	"github.com/gravitational/trace"
 )
 
 type OpType int
+
+func (o OpType) Operation() (walpb.Operation, error) {
+	switch o {
+	case OpCreate:
+		return walpb.Operation_CREATE, nil
+	case OpUpdate:
+		return walpb.Operation_UPDATE, nil
+	case OpPut:
+		return walpb.Operation_PUT, nil
+	case OpDelete:
+		return walpb.Operation_DELETE, nil
+	default:
+		return -1, trace.BadParameter("unsupported operation %v", o)
+	}
+}
 
 const (
 	OpCreate OpType = iota
@@ -19,8 +38,8 @@ type Record struct {
 	Type OpType
 	// Key is a key to perform operation on
 	Key []byte
-	// Value is a value to perform operation on
-	Value []byte
+	// Val is a value to perform operation on
+	Val []byte
 }
 
 // Log is operation log, it serializes
