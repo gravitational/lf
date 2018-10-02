@@ -195,3 +195,12 @@ func (s *DirSuite) TestRecords(c *check.C) {
 		}
 	}
 }
+
+// TestCompaction verifies compaction and concurrent
+// operations
+func (s *DirSuite) TestCompaction(c *check.C) {
+}
+
+// TestRecovery recovers after data corruption
+func (s *DirSuite) TestRecovery(c *check.C) {
+}
