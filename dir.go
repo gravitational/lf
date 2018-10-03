@@ -2,8 +2,6 @@ package lf
 
 import (
 	"context"
-	"encoding/binary"
-	"errors"
 	"io"
 	"io/ioutil"
 	"math"
@@ -17,9 +15,10 @@ import (
 	"github.com/gravitational/trace"
 )
 
+// DirLogConfig holds configuration for directory
 type DirLogConfig struct {
-	Dir    string
-	Prefix string
+	// Dir is a directory with log files
+	Dir string
 }
 
 // CheckAndSetDefaults checks and sets default values
@@ -55,70 +54,110 @@ func NewDirLog(cfg DirLogConfig) (*DirLog, error) {
 
 type DirLog struct {
 	DirLogConfig
+	// file is a currently opened log file
 	file *os.File
-	pid  int
+	// pool contains slice bytes
+	// re-used to marshal and unmarshal containers,
+	// used to reduce memory allocations
 	pool *sync.Pool
 	// kv is a map of keys and values
-	kv        map[string][]byte
-	id        uint64
+	kv map[string][]byte
+	// id is a current record id,
+	// incremented on every record read
+	id uint64
+	// state is a current database state
+	state walpb.State
+	// marshaler is a container marshaler
 	marshaler *ContainerMarshaler
 }
 
 const (
-	pidFilename = "pid"
+	// V1 is a current schema version
+	V1 = iota
 )
 
-// pickProcessID makes sure the monotonically increasing process id
+const (
+	// stateFilename
+	stateFilename = "state"
+	// firstLogFileName
+	firstLogFileName = "first"
+	// secondLogFileName
+	secondLogFileName = "second"
+)
+
+// writeState overwrites state file,
+// implies that file is already locked
+func (d *DirLog) writeState(f *os.File, state *walpb.State) error {
+	data, err := state.Marshal()
+	if err != nil {
+		return trace.Wrap(err)
+	}
+	containerData, err := ContainerMarshal(data)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+	if _, err := f.Seek(0, 0); err != nil {
+		return trace.ConvertSystemError(err)
+	}
+	// containers are of the same exact length, so this is a simple
+	// one to one overwrite
+	_, err = f.Write(containerData)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+	return nil
+}
+
+// initOrUpdateState makes sure the monotonically increasing process id
 // gets picked by the starting directory log by opening a file in exclusive
 // mode, reading container id with encoded binary,
 // incrementing it, writing it back, releasing the lock and closing the file
-func (d *DirLog) pickProcessID() (uint64, error) {
-	f, err := os.OpenFile(filepath.Join(d.Dir, pidFilename), os.O_RDWR|os.O_CREATE, 0600)
+func (d *DirLog) initOrUpdateState() (*walpb.State, error) {
+	f, err := os.OpenFile(filepath.Join(d.Dir, stateFilename), os.O_RDWR|os.O_CREATE, 0600)
 	if err != nil {
-		return 0, trace.ConvertSystemError(err)
+		return nil, trace.ConvertSystemError(err)
 	}
 	defer f.Close()
 	if err := fs.WriteLock(f); err != nil {
-		return 0, trace.Wrap(err)
+		return nil, trace.Wrap(err)
 	}
 	defer fs.Unlock(f)
 	bytes, err := ioutil.ReadAll(f)
 	if err != nil {
-		return 0, trace.Wrap(err)
+		return nil, trace.Wrap(err)
 	}
-	var pid uint64
+	var state walpb.State
 	if len(bytes) != 0 {
 		// read container with encoded pid
 		data, err := ContainerUnmarshal(bytes)
 		if err != nil {
-			return 0, trace.Wrap(err)
+			return nil, trace.Wrap(err)
 		}
-		pid = binary.LittleEndian.Uint64(data)
-		if pid == math.MaxUint64 {
-			return 0, trace.BadParameter("maximum value of %v reached for process ids", pid)
+		if err := state.Unmarshal(data); err != nil {
+			return nil, trace.Wrap(err)
 		}
+		if state.ProcessID == math.MaxUint64 {
+			return nil, trace.Wrap(&CompactionRequiredError{})
+		}
+	} else {
+		state.ProcessID = 0
+		state.CurrentFile = firstLogFileName
+		state.SchemaVersion = V1
 	}
-	pid = pid + 1
-	out := make([]byte, 8)
-	binary.LittleEndian.PutUint64(out, pid)
-	data, err := ContainerMarshal(out)
-	if err != nil {
-		return 0, trace.Wrap(err)
+	state.ProcessID += 1
+	if err := d.writeState(f, &state); err != nil {
+		return nil, trace.Wrap(err)
 	}
-	if _, err := f.Seek(0, 0); err != nil {
-		return 0, trace.Wrap(err)
-	}
-	// containers are of the same exact length, so this is a simple
-	// one to one overwrite
-	_, err = f.Write(data)
-	if err != nil {
-		return 0, trace.Wrap(err)
-	}
-	return pid, nil
+	return &state, nil
 }
 
 func (d *DirLog) open() error {
-	f, err := os.OpenFile(filepath.Join(d.Dir, d.Prefix+"1.wal"), os.O_RDWR|os.O_CREATE, 0600)
+	state, err := d.initOrUpdateState()
+	if err != nil {
+		return trace.Wrap(err)
+	}
+	d.state = *state
+	f, err := os.OpenFile(filepath.Join(d.Dir, d.state.CurrentFile), os.O_RDWR|os.O_CREATE, 0600)
 	if err != nil {
 		return trace.ConvertSystemError(err)
 	}
@@ -172,7 +211,7 @@ func (d *DirLog) readAll() error {
 		record, err := reader.next()
 		if err != nil {
 			err = trace.Unwrap(err)
-			if err == errPartialRecord {
+			if IsPartialReadError(err) {
 				continue
 			}
 			if err == io.EOF {
@@ -249,7 +288,7 @@ func (d *DirLog) split(src Record) (*walpb.Record, []walpb.Record, error) {
 	id := atomic.AddUint64(&d.id, 1)
 	fullRecord := walpb.Record{
 		Operation: op,
-		ProcessID: uint64(d.pid),
+		ProcessID: uint64(d.state.ProcessID),
 		ID:        id,
 		Key:       src.Key,
 		Val:       src.Val,
@@ -271,7 +310,7 @@ func (d *DirLog) split(src Record) (*walpb.Record, []walpb.Record, error) {
 		}
 		part := walpb.Record{
 			Operation: op,
-			ProcessID: uint64(d.pid),
+			ProcessID: uint64(d.state.ProcessID),
 			ID:        id,
 			LastPart:  false,
 			PartID:    partID,
@@ -417,7 +456,5 @@ func (r *reader) next() (*walpb.Record, error) {
 	if record != nil {
 		return record, nil
 	}
-	return nil, errPartialRecord
+	return nil, &PartialReadError{}
 }
-
-var errPartialRecord = errors.New("partial record read")

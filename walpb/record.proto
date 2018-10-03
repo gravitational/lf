@@ -8,14 +8,22 @@ option (gogoproto.sizer_all) = true;
 option (gogoproto.unmarshaler_all) = true;
 option (gogoproto.goproto_getters_all) = false;
 
-// Operation
+// Operation identifies type of record
 enum Operation {
-  CREATE = 0;
-  UPDATE = 1;
-  PUT    = 2;
-  DELETE = 3;
+    // CREATE creates key-value pair
+    CREATE = 0;
+    // UPDATE deletes key-value pair
+    UPDATE = 1;
+    // PUT creates or updates existing key-value pair
+    PUT    = 2;
+    // DELETE deletes key-value pair
+    DELETE = 3;
+    // REOPEN is a system record signalling
+    // readers/writers to re-open the database (after compaction)
+    REOPEN = 4;
 }
 
+// Record is a record stored in operation log file
 message Record {
     // ProcessID identifies different processes writing
     // to the log, processes have to increase monotonically
@@ -41,6 +49,19 @@ message Record {
     required Operation Operation =  5 [(gogoproto.nullable) = false];
     // Key is the key in the key value tuple being created, updated or deleted
 	optional bytes  Key          =  6;
-    // Val is set for all operations except DELETE
+    // Val is set for all operations except DELETE, REOPEN
 	optional bytes  Val          =  7;
+}
+
+// State represents database state
+message State {
+    // SchemaVersion is a version of the database schema
+    required uint64 SchemaVersion = 1  [(gogoproto.nullable) = false];
+    // ProcessID identifies different processes writing
+    // to the log, processes have to increase monotonically
+    // and be different for different processes writing
+    // to the same file to preserve integrity    
+    required uint64 ProcessID = 2 [(gogoproto.nullable) = false];
+    // CurrentFile points to current file name
+    required string CurrentFile = 3  [(gogoproto.nullable) = false];
 }

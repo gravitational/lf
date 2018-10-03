@@ -19,7 +19,6 @@ package lf
 
 import (
 	"encoding/binary"
-	"fmt"
 	"hash/crc32"
 
 	"github.com/gravitational/trace"
@@ -114,26 +113,6 @@ func (c *ContainerMarshaler) Unmarshal(dest []byte, source []byte) (int, error) 
 	copy(dest, source[headerSizeBytes:dataLength+headerSizeBytes])
 
 	return int(dataLength), nil
-}
-
-// DataCorruptionError indicates that data has been corrupted
-type DataCorruptionError struct {
-	// ExpectedChecksum is an expected checksum value
-	ExpectedChecksum uint32
-	// ComputedChecksum is a computed checksum value
-	ComputedChecksum uint32
-}
-
-// Error returns a formatted user-friendly message
-func (e DataCorruptionError) Error() string {
-	return fmt.Sprintf("checksum mismatch, expected checksum %v != computed checksum %v",
-		e.ExpectedChecksum, e.ComputedChecksum)
-}
-
-// IsDataCorruptionError returns true if given error is data corruption error
-func IsDataCorruptionError(e error) bool {
-	_, ok := trace.Unwrap(e).(*DataCorruptionError)
-	return ok
 }
 
 // ContainerMarshalString is a utility function to marshal string of bytes
