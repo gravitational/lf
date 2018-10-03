@@ -62,9 +62,9 @@ type DirLog struct {
 	pool *sync.Pool
 	// kv is a map of keys and values
 	kv map[string][]byte
-	// id is a current record id,
+	// recordID is a current record id,
 	// incremented on every record read
-	id uint64
+	recordID uint64
 	// state is a current database state
 	state walpb.State
 	// marshaler is a container marshaler
@@ -84,6 +84,106 @@ const (
 	// secondLogFileName
 	secondLogFileName = "second"
 )
+
+// tryCompactAndReopen tries to compact the database,
+// if it succeeds, it will reopen the database
+func (d *DirLog) tryCompactAndReopen(ctx context.Context) error {
+	if err := d.tryCompact(ctx); err != nil {
+		return trace.Wrap(err)
+	}
+	if err := d.Close(); err != nil {
+		return trace.Wrap(err)
+	}
+	return d.open()
+}
+
+// tryCompact attempts to grab locks and compact files
+// it never waits for lock forever to avoid deadlocks (as it tries
+// to grab multiple files at once)
+// tryCompact assumes that the database is opened
+// by this dir log
+func (d *DirLog) tryCompact(ctx context.Context) error {
+	// 1. grab write locks on state file and both log files
+	stateFile, err := os.OpenFile(filepath.Join(d.Dir, stateFilename), os.O_RDWR|os.O_CREATE, 0600)
+	if err != nil {
+		return trace.ConvertSystemError(err)
+	}
+	defer stateFile.Close()
+	if err := fs.TryWriteLock(stateFile); err != nil {
+		return trace.Wrap(err)
+	}
+	defer fs.Unlock(stateFile)
+
+	firstFile, err := os.OpenFile(filepath.Join(d.Dir, firstLogFileName), os.O_RDWR|os.O_CREATE, 0600)
+	if err != nil {
+		return trace.ConvertSystemError(err)
+	}
+	if err := fs.TryWriteLock(firstFile); err != nil {
+		return trace.Wrap(err)
+	}
+	defer fs.Unlock(firstFile)
+
+	secondFile, err := os.OpenFile(filepath.Join(d.Dir, secondLogFileName), os.O_RDWR|os.O_CREATE, 0600)
+	if err != nil {
+		return trace.ConvertSystemError(err)
+	}
+	if err := fs.TryWriteLock(secondFile); err != nil {
+		return trace.Wrap(err)
+	}
+	defer fs.Unlock(secondFile)
+
+	// 2. catch up on all latest reads
+	if err := d.readAll(); err != nil {
+		return trace.Wrap(err)
+	}
+
+	// 3. write the compacted version of the data to the non-current file
+	var compactedFile *os.File
+	if filepath.Base(d.file.Name()) == firstLogFileName {
+		compactedFile = secondFile
+	} else {
+		compactedFile = firstFile
+	}
+	if err := compactedFile.Truncate(0); err != nil {
+		return trace.Wrap(err)
+	}
+
+	newState := walpb.State{
+		SchemaVersion: V1,
+		ProcessID:     1,
+		CurrentFile:   filepath.Base(compactedFile.Name()),
+	}
+
+	var recordID uint64
+	for key, val := range d.kv {
+		r := Record{
+			Type: OpCreate,
+			Key:  []byte(key),
+			Val:  val,
+		}
+		_, err := d.appendRecord(ctx, compactedFile, newState.ProcessID, &recordID, r)
+		if err != nil {
+			return trace.Wrap(err)
+		}
+	}
+
+	// 4. append a "reopen" record to the currently active log file
+	// so that other processes that have the current log file
+	// opened, will reopen the database
+	_, err = d.appendRecord(ctx, d.file, d.state.ProcessID, &d.recordID, Record{Type: OpReopen})
+	if err != nil {
+		return trace.Wrap(err)
+	}
+
+	// 5. write state, so new clients will open
+	// the new log file right away
+	err = d.writeState(stateFile, &newState)
+	if err != nil {
+		return trace.Wrap(err)
+	}
+
+	return nil
+}
 
 // writeState overwrites state file,
 // implies that file is already locked
@@ -151,6 +251,7 @@ func (d *DirLog) initOrUpdateState() (*walpb.State, error) {
 	return &state, nil
 }
 
+// open opens database and inits internal state
 func (d *DirLog) open() error {
 	state, err := d.initOrUpdateState()
 	if err != nil {
@@ -251,10 +352,18 @@ func (d *DirLog) Append(ctx context.Context, r Record) error {
 	if err := d.readAll(); err != nil {
 		return trace.Wrap(err)
 	}
-	// now can write the record
-	fullRecord, parts, err := d.split(r)
+	fullRecord, err := d.appendRecord(ctx, d.file, d.state.ProcessID, &d.recordID, r)
 	if err != nil {
 		return trace.Wrap(err)
+	}
+	d.processRecord(fullRecord)
+	return nil
+}
+
+func (d *DirLog) appendRecord(ctx context.Context, f *os.File, pid uint64, recordID *uint64, r Record) (*walpb.Record, error) {
+	fullRecord, parts, err := d.split(r, pid, recordID)
+	if err != nil {
+		return nil, trace.Wrap(err)
 	}
 	protoBuffer := d.pool.Get().([]byte)
 	defer d.pool.Put(zero(protoBuffer))
@@ -265,30 +374,29 @@ func (d *DirLog) Append(ctx context.Context, r Record) error {
 	for _, part := range parts {
 		size, err := part.MarshalTo(protoBuffer)
 		if err != nil {
-			return trace.Wrap(err)
+			return nil, trace.Wrap(err)
 		}
 		err = d.marshaler.Marshal(containerBuffer, protoBuffer[:size])
 		if err != nil {
-			return trace.Wrap(err)
+			return nil, trace.Wrap(err)
 		}
-		_, err = d.file.Write(containerBuffer)
+		_, err = f.Write(containerBuffer)
 		if err != nil {
-			return trace.ConvertSystemError(err)
+			return nil, trace.ConvertSystemError(err)
 		}
 	}
-	d.processRecord(fullRecord)
-	return nil
+	return fullRecord, nil
 }
 
-func (d *DirLog) split(src Record) (*walpb.Record, []walpb.Record, error) {
+func (d *DirLog) split(src Record, pid uint64, recordID *uint64) (*walpb.Record, []walpb.Record, error) {
 	op, err := src.Type.Operation()
 	if err != nil {
 		return nil, nil, trace.Wrap(err)
 	}
-	id := atomic.AddUint64(&d.id, 1)
+	id := atomic.AddUint64(recordID, 1)
 	fullRecord := walpb.Record{
 		Operation: op,
-		ProcessID: uint64(d.state.ProcessID),
+		ProcessID: uint64(pid),
 		ID:        id,
 		Key:       src.Key,
 		Val:       src.Val,

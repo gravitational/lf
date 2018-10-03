@@ -20,6 +20,8 @@ func (o OpType) Operation() (walpb.Operation, error) {
 		return walpb.Operation_PUT, nil
 	case OpDelete:
 		return walpb.Operation_DELETE, nil
+	case OpReopen:
+		return walpb.Operation_REOPEN, nil
 	default:
 		return -1, trace.BadParameter("unsupported operation %v", o)
 	}
@@ -30,6 +32,7 @@ const (
 	OpUpdate OpType = iota
 	OpPut    OpType = iota
 	OpDelete OpType = iota
+	OpReopen OpType = iota
 )
 
 // Record is a record containing operation
@@ -48,8 +51,8 @@ func (r *Record) CheckAndSetDefaults() error {
 	if err != nil {
 		return trace.Wrap(err)
 	}
-	if len(r.Key) == 0 {
-		return trace.BadParameter("missing parameter key")
+	if r.Type != OpReopen && len(r.Key) == 0 {
+		return trace.BadParameter("missing parameter key for record type %v", r.Type)
 	}
 	return nil
 }
