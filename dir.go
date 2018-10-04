@@ -28,12 +28,18 @@ type DirLogConfig struct {
 	// RetryOpenPeriod is a time between reopen attempts
 	// in case if database is being compacted
 	RetryOpenPeriod time.Duration
+	// OpenTimeout is a default timeout
+	// for the database open operation to fail
+	OpenTimeout time.Duration
 }
 
 const (
 	// DefaultRetryOpenPeriod is a default period between
 	// open attempts
 	DefaultRetryOpenPeriod = 300 * time.Millisecond
+	// DefaultOpenTimeout is a default timeout
+	// for open operation to time out
+	DefaultOpenTimeout = 30 * time.Second
 )
 
 // CheckAndSetDefaults checks and sets default values
@@ -46,6 +52,9 @@ func (cfg *DirLogConfig) CheckAndSetDefaults() error {
 	}
 	if cfg.RetryOpenPeriod == 0 {
 		cfg.RetryOpenPeriod = DefaultRetryOpenPeriod
+	}
+	if cfg.OpenTimeout == 0 {
+		cfg.OpenTimeout = DefaultOpenTimeout
 	}
 	return nil
 }
@@ -66,6 +75,9 @@ func NewDirLog(cfg DirLogConfig) (*DirLog, error) {
 			return make([]byte, ContainerSizeBytes)
 		},
 	}
+	openTimeout := time.NewTimer(cfg.OpenTimeout)
+	defer openTimeout.Stop()
+
 	for {
 		// try to reopen the database if compaction is required
 		err := d.open()
@@ -83,6 +95,8 @@ func NewDirLog(cfg DirLogConfig) (*DirLog, error) {
 			return nil, trace.Wrap(err)
 		}
 		select {
+		case <-openTimeout.C:
+			return nil, trace.ConnectionProblem(err, "database is locked by another process")
 		case <-time.After(d.RetryOpenPeriod):
 			continue
 		case <-d.Context.Done():
