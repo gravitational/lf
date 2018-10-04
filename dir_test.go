@@ -19,6 +19,7 @@ package lf
 import (
 	"bytes"
 	"context"
+	"path/filepath"
 
 	"github.com/gravitational/trace"
 	check "gopkg.in/check.v1"
@@ -199,6 +200,47 @@ func (s *DirSuite) TestRecords(c *check.C) {
 // TestCompaction verifies compaction and concurrent
 // operations
 func (s *DirSuite) TestCompaction(c *check.C) {
+	dir := c.MkDir()
+	l, err := NewDirLog(DirLogConfig{
+		Dir: dir,
+	})
+	c.Assert(err, check.IsNil)
+	defer l.Close()
+
+	c.Assert(filepath.Base(l.file.Name()), check.Equals, firstLogFileName)
+	c.Assert(l.state.ProcessID, check.Equals, uint64(1))
+
+	l2, err := NewDirLog(DirLogConfig{
+		Dir: dir,
+	})
+	c.Assert(err, check.IsNil)
+	defer l2.Close()
+
+	c.Assert(filepath.Base(l2.file.Name()), check.Equals, firstLogFileName)
+	c.Assert(l2.state.ProcessID, check.Equals, uint64(2))
+
+	err = l.Append(context.TODO(),
+		Record{Type: OpCreate, Key: []byte("hello"), Val: []byte("world")})
+	c.Assert(err, check.IsNil)
+
+	// compact and reopen the database
+	err = l.tryCompactAndReopen(context.TODO())
+	c.Assert(err, check.IsNil)
+
+	c.Assert(filepath.Base(l.file.Name()), check.Equals, secondLogFileName)
+	c.Assert(l.state.ProcessID, check.Equals, uint64(2))
+
+	// value should be there for both l1 and l2
+	out, err := l.Get("hello")
+	c.Assert(err, check.IsNil)
+	c.Assert(out, check.DeepEquals, []byte("world"))
+
+	out, err = l2.Get("hello")
+	c.Assert(err, check.IsNil)
+	c.Assert(out, check.DeepEquals, []byte("world"))
+
+	c.Assert(filepath.Base(l2.file.Name()), check.Equals, secondLogFileName)
+	c.Assert(l2.state.ProcessID, check.Equals, uint64(3))
 }
 
 // TestRecovery recovers after data corruption

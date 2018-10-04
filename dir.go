@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/gravitational/lf/fs"
 	"github.com/gravitational/lf/walpb"
@@ -19,12 +20,32 @@ import (
 type DirLogConfig struct {
 	// Dir is a directory with log files
 	Dir string
+	// Context is a context for opening the
+	// database, this process can take several seconds
+	// during compactions, context allows to cancel
+	// opening the database
+	Context context.Context
+	// RetryOpenPeriod is a time between reopen attempts
+	// in case if database is being compacted
+	RetryOpenPeriod time.Duration
 }
+
+const (
+	// DefaultRetryOpenPeriod is a default period between
+	// open attempts
+	DefaultRetryOpenPeriod = 300 * time.Millisecond
+)
 
 // CheckAndSetDefaults checks and sets default values
 func (cfg *DirLogConfig) CheckAndSetDefaults() error {
 	if cfg.Dir == "" {
 		return trace.BadParameter("missing parameter Dir")
+	}
+	if cfg.Context == nil {
+		cfg.Context = context.Background()
+	}
+	if cfg.RetryOpenPeriod == 0 {
+		cfg.RetryOpenPeriod = DefaultRetryOpenPeriod
 	}
 	return nil
 }
@@ -45,11 +66,29 @@ func NewDirLog(cfg DirLogConfig) (*DirLog, error) {
 			return make([]byte, ContainerSizeBytes)
 		},
 	}
-	if err := d.open(); err != nil {
-		return nil, trace.Wrap(err)
+	for {
+		// try to reopen the database if compaction is required
+		err := d.open()
+		if err == nil {
+			return d, nil
+		}
+		if !IsCompactionRequiredError(err) {
+			return nil, trace.Wrap(err)
+		}
+		err = d.tryCompact(d.Context)
+		if err == nil {
+			return d, nil
+		}
+		if !trace.IsCompareFailed(err) {
+			return nil, trace.Wrap(err)
+		}
+		select {
+		case <-time.After(d.RetryOpenPeriod):
+			continue
+		case <-d.Context.Done():
+			return nil, trace.ConnectionProblem(err, "database is locked by another process")
+		}
 	}
-
-	return d, nil
 }
 
 type DirLog struct {
@@ -320,12 +359,32 @@ func (d *DirLog) readAll() error {
 			}
 			return trace.Wrap(err)
 		}
+		if record.Operation == walpb.Operation_REOPEN {
+			return trace.Wrap(&ReopenDatabaseError{})
+		}
 		d.processRecord(record)
 	}
 }
 
-//
 func (d *DirLog) Get(key string) ([]byte, error) {
+	val, err := d.tryGet(key)
+	if err != nil {
+		if !IsReopenDatabaseError(err) {
+			return nil, trace.Wrap(err)
+		}
+		if err := d.Close(); err != nil {
+			return nil, trace.Wrap(err)
+		}
+		if err := d.open(); err != nil {
+			return nil, trace.Wrap(err)
+		}
+		return d.tryGet(key)
+	}
+	return val, nil
+}
+
+//
+func (d *DirLog) tryGet(key string) ([]byte, error) {
 	if err := fs.ReadLock(d.file); err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -341,6 +400,23 @@ func (d *DirLog) Get(key string) ([]byte, error) {
 }
 
 func (d *DirLog) Append(ctx context.Context, r Record) error {
+	err := d.tryAppend(ctx, r)
+	if err != nil {
+		if !IsReopenDatabaseError(err) {
+			return trace.Wrap(err)
+		}
+		if err := d.Close(); err != nil {
+			return trace.Wrap(err)
+		}
+		if err := d.open(); err != nil {
+			return trace.Wrap(err)
+		}
+		return d.Append(ctx, r)
+	}
+	return nil
+}
+
+func (d *DirLog) tryAppend(ctx context.Context, r Record) error {
 	if err := r.CheckAndSetDefaults(); err != nil {
 		return trace.Wrap(err)
 	}

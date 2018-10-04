@@ -57,3 +57,20 @@ func IsPartialReadError(e error) bool {
 	_, ok := trace.Unwrap(e).(*PartialReadError)
 	return ok
 }
+
+// ReopenDatabaseError indicates that database has to be reopened
+// after compaction
+type ReopenDatabaseError struct {
+}
+
+// Error returns a formatted user-friendly message
+func (e ReopenDatabaseError) Error() string {
+	return "reopen the database"
+}
+
+// IsReopenDatabaseError returns true if given error indicates that database
+// has to be reopened
+func IsReopenDatabaseError(e error) bool {
+	_, ok := trace.Unwrap(e).(*ReopenDatabaseError)
+	return ok
+}
