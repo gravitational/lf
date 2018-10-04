@@ -27,6 +27,23 @@ func (o OpType) Operation() (walpb.Operation, error) {
 	}
 }
 
+func FromRecordOperation(op walpb.Operation) (OpType, error) {
+	switch op {
+	case walpb.Operation_CREATE:
+		return OpCreate, nil
+	case walpb.Operation_UPDATE:
+		return OpUpdate, nil
+	case walpb.Operation_PUT:
+		return OpPut, nil
+	case walpb.Operation_DELETE:
+		return OpDelete, nil
+	case walpb.Operation_REOPEN:
+		return OpReopen, nil
+	default:
+		return 0, trace.BadParameter("unsupported operation %v", op)
+	}
+}
+
 const (
 	OpCreate OpType = iota
 	OpUpdate OpType = iota
@@ -65,6 +82,7 @@ type Log interface {
 	// Append appends record
 	Append(ctx context.Context, r Record) error
 	// Close closes all associated resources
+	Close() error
 }
 
 type Watcher interface {

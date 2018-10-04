@@ -25,3 +25,7 @@ buildbox-gen:
 	echo $$PROTO_INCLUDE
 	cd walpb && protoc --gogofast_out=. -I=.:$$PROTO_INCLUDE *.proto
 
+# sloccount returns a count of lines in go sources
+.PHONY: sloccount
+sloccount:
+	find . -path ./vendor -prune -o -name "*.go" -print0 | xargs -0 wc -l

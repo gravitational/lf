@@ -13,7 +13,35 @@ import (
 
 	"github.com/gravitational/lf/fs"
 	"github.com/gravitational/lf/walpb"
+
+	"github.com/fsnotify/fsnotify"
 	"github.com/gravitational/trace"
+	log "github.com/sirupsen/logrus"
+)
+
+const (
+	// V1 is a current schema version
+	V1 = iota
+	// DefaultRetryOpenPeriod is a default period between
+	// open attempts
+	DefaultRetryOpenPeriod = 300 * time.Millisecond
+	// DefaultOpenTimeout is a default timeout
+	// for open operation to time out
+	DefaultOpenTimeout = 30 * time.Second
+)
+
+const (
+	// stateFilename
+	stateFilename = "state"
+	// firstLogFileName
+	firstLogFileName = "first"
+	// secondLogFileName
+	secondLogFileName = "second"
+	// recordBatchSize is a batch up to 50 records
+	// to read in watcher (to avoid holding lock for a long time)
+	recordBatchSize = 50
+	// componentLogFormat is a component used in logs
+	componentLogFormat = "lf"
 )
 
 // DirLogConfig holds configuration for directory
@@ -32,15 +60,6 @@ type DirLogConfig struct {
 	// for the database open operation to fail
 	OpenTimeout time.Duration
 }
-
-const (
-	// DefaultRetryOpenPeriod is a default period between
-	// open attempts
-	DefaultRetryOpenPeriod = 300 * time.Millisecond
-	// DefaultOpenTimeout is a default timeout
-	// for open operation to time out
-	DefaultOpenTimeout = 30 * time.Second
-)
 
 // CheckAndSetDefaults checks and sets default values
 func (cfg *DirLogConfig) CheckAndSetDefaults() error {
@@ -66,6 +85,9 @@ func NewDirLog(cfg DirLogConfig) (*DirLog, error) {
 		return nil, trace.Wrap(err)
 	}
 	d := &DirLog{
+		Entry: log.WithFields(log.Fields{
+			trace.Component: componentLogFormat,
+		}),
 		DirLogConfig: cfg,
 		kv:           make(map[string][]byte),
 		marshaler:    NewContainerMarshaler(),
@@ -106,6 +128,7 @@ func NewDirLog(cfg DirLogConfig) (*DirLog, error) {
 }
 
 type DirLog struct {
+	*log.Entry
 	DirLogConfig
 	// file is a currently opened log file
 	file *os.File
@@ -124,19 +147,52 @@ type DirLog struct {
 	marshaler *ContainerMarshaler
 }
 
-const (
-	// V1 is a current schema version
-	V1 = iota
-)
-
-const (
-	// stateFilename
-	stateFilename = "state"
-	// firstLogFileName
-	firstLogFileName = "first"
-	// secondLogFileName
-	secondLogFileName = "second"
-)
+// NewWatcher returns new watcher matching prefix,
+// if prefix is supplied, only events matching the prefix
+// will be returned, otherwise, all events will be returned
+// offset is optional and is used to locate the proper offset
+func (d *DirLog) NewWatcher(prefix []byte, offset string) (*DirWatcher, error) {
+	fsWatcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		return nil, trace.ConvertSystemError(err)
+	}
+	// grab state lock to make sure we are watching the right file
+	stateFile, err := os.OpenFile(filepath.Join(d.Dir, stateFilename), os.O_RDWR|os.O_CREATE, 0600)
+	if err != nil {
+		fsWatcher.Close()
+		return nil, trace.ConvertSystemError(err)
+	}
+	defer stateFile.Close()
+	if err := fs.WriteLock(stateFile); err != nil {
+		fsWatcher.Close()
+		return nil, trace.Wrap(err)
+	}
+	defer fs.Unlock(stateFile)
+	if err := fsWatcher.Add(d.file.Name()); err != nil {
+		fsWatcher.Close()
+		return nil, trace.ConvertSystemError(err)
+	}
+	logFile, err := os.OpenFile(d.file.Name(), os.O_RDWR, 0600)
+	if err != nil {
+		fsWatcher.Close()
+		return nil, trace.ConvertSystemError(err)
+	}
+	ctx, cancel := context.WithCancel(d.Context)
+	dirWatcher := &DirWatcher{
+		Entry: log.WithFields(log.Fields{
+			trace.Component: componentLogFormat,
+		}),
+		dir:     d,
+		prefix:  prefix,
+		watcher: fsWatcher,
+		eventsC: make(chan Record),
+		cancel:  cancel,
+		ctx:     ctx,
+		logFile: logFile,
+	}
+	go dirWatcher.watch()
+	return dirWatcher, nil
+}
 
 // tryCompactAndReopen tries to compact the database,
 // if it succeeds, it will reopen the database
@@ -186,7 +242,7 @@ func (d *DirLog) tryCompact(ctx context.Context) error {
 	defer fs.Unlock(secondFile)
 
 	// 2. catch up on all latest reads
-	if err := d.readAll(); err != nil {
+	if err := d.readAll(d.file, -1, d.processRecord); err != nil {
 		return trace.Wrap(err)
 	}
 
@@ -328,7 +384,7 @@ func (d *DirLog) Close() error {
 	return nil
 }
 
-func (d *DirLog) newReader() *reader {
+func (d *DirLog) newReader(f *os.File) *reader {
 	srcBuffer := d.pool.Get().([]byte)
 	defer d.pool.Put(zero(srcBuffer))
 
@@ -338,7 +394,7 @@ func (d *DirLog) newReader() *reader {
 	records := &recordMarshaler{}
 
 	return &reader{
-		file:      d.file,
+		file:      f,
 		srcBuffer: srcBuffer,
 		dstBuffer: dstBuffer,
 		records:   records,
@@ -357,10 +413,14 @@ func (d *DirLog) processRecord(record *walpb.Record) {
 	}
 }
 
+type processRecord func(*walpb.Record)
+
 // readAll reads logs from the current file
-// log position up to the end
-func (d *DirLog) readAll() error {
-	reader := d.newReader()
+// log position up to the end, in case if limit is > 0, up to limit records
+// will be read, otherwise all records will be read up to the end
+func (d *DirLog) readAll(f *os.File, limit int, processRecord processRecord) error {
+	reader := d.newReader(f)
+	count := 0
 	for {
 		record, err := reader.next()
 		if err != nil {
@@ -376,7 +436,11 @@ func (d *DirLog) readAll() error {
 		if record.Operation == walpb.Operation_REOPEN {
 			return trace.Wrap(&ReopenDatabaseError{})
 		}
-		d.processRecord(record)
+		processRecord(record)
+		count += 1
+		if limit > 0 && count >= limit {
+			return nil
+		}
 	}
 }
 
@@ -403,7 +467,7 @@ func (d *DirLog) tryGet(key string) ([]byte, error) {
 		return nil, trace.Wrap(err)
 	}
 	defer fs.Unlock(d.file)
-	if err := d.readAll(); err != nil {
+	if err := d.readAll(d.file, -1, d.processRecord); err != nil {
 		return nil, trace.Wrap(err)
 	}
 	val, ok := d.kv[key]
@@ -439,7 +503,7 @@ func (d *DirLog) tryAppend(ctx context.Context, r Record) error {
 		return trace.Wrap(err)
 	}
 	defer fs.Unlock(d.file)
-	if err := d.readAll(); err != nil {
+	if err := d.readAll(d.file, -1, d.processRecord); err != nil {
 		return trace.Wrap(err)
 	}
 	fullRecord, err := d.appendRecord(ctx, d.file, d.state.ProcessID, &d.recordID, r)
