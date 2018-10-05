@@ -14,20 +14,13 @@ import (
 	"github.com/gravitational/lf/fs"
 	"github.com/gravitational/lf/walpb"
 
-	"github.com/fsnotify/fsnotify"
+	log "github.com/gravitational/logrus"
 	"github.com/gravitational/trace"
-	log "github.com/sirupsen/logrus"
 )
 
 const (
 	// V1 is a current schema version
-	V1 = iota
-	// DefaultRetryOpenPeriod is a default period between
-	// open attempts
-	DefaultRetryOpenPeriod = 300 * time.Millisecond
-	// DefaultOpenTimeout is a default timeout
-	// for open operation to time out
-	DefaultOpenTimeout = 30 * time.Second
+	V1 = 1
 )
 
 const (
@@ -42,6 +35,8 @@ const (
 	recordBatchSize = 50
 	// componentLogFormat is a component used in logs
 	componentLogFormat = "lf"
+	// defaultPollPeriod is a default period between polling attempts
+	defaultPollPeriod = time.Second
 )
 
 // DirLogConfig holds configuration for directory
@@ -53,12 +48,9 @@ type DirLogConfig struct {
 	// during compactions, context allows to cancel
 	// opening the database
 	Context context.Context
-	// RetryOpenPeriod is a time between reopen attempts
-	// in case if database is being compacted
-	RetryOpenPeriod time.Duration
-	// OpenTimeout is a default timeout
-	// for the database open operation to fail
-	OpenTimeout time.Duration
+	// PollPeriod is a period between
+	// polling attempts, used in watchers
+	PollPeriod time.Duration
 }
 
 // CheckAndSetDefaults checks and sets default values
@@ -69,11 +61,8 @@ func (cfg *DirLogConfig) CheckAndSetDefaults() error {
 	if cfg.Context == nil {
 		cfg.Context = context.Background()
 	}
-	if cfg.RetryOpenPeriod == 0 {
-		cfg.RetryOpenPeriod = DefaultRetryOpenPeriod
-	}
-	if cfg.OpenTimeout == 0 {
-		cfg.OpenTimeout = DefaultOpenTimeout
+	if cfg.PollPeriod == 0 {
+		cfg.PollPeriod = defaultPollPeriod
 	}
 	return nil
 }
@@ -89,7 +78,7 @@ func NewDirLog(cfg DirLogConfig) (*DirLog, error) {
 			trace.Component: componentLogFormat,
 		}),
 		DirLogConfig: cfg,
-		kv:           make(map[string][]byte),
+		kv:           make(map[string]Item),
 		marshaler:    NewContainerMarshaler(),
 	}
 	d.pool = &sync.Pool{
@@ -97,34 +86,12 @@ func NewDirLog(cfg DirLogConfig) (*DirLog, error) {
 			return make([]byte, ContainerSizeBytes)
 		},
 	}
-	openTimeout := time.NewTimer(cfg.OpenTimeout)
-	defer openTimeout.Stop()
 
-	for {
-		// try to reopen the database if compaction is required
-		err := d.open()
-		if err == nil {
-			return d, nil
-		}
-		if !IsCompactionRequiredError(err) {
-			return nil, trace.Wrap(err)
-		}
-		err = d.tryCompact(d.Context)
-		if err == nil {
-			return d, nil
-		}
-		if !trace.IsCompareFailed(err) {
-			return nil, trace.Wrap(err)
-		}
-		select {
-		case <-openTimeout.C:
-			return nil, trace.ConnectionProblem(err, "database is locked by another process")
-		case <-time.After(d.RetryOpenPeriod):
-			continue
-		case <-d.Context.Done():
-			return nil, trace.ConnectionProblem(err, "database is locked by another process")
-		}
+	if err := d.open(); err != nil {
+		return nil, trace.Wrap(err)
 	}
+
+	return d, nil
 }
 
 type DirLog struct {
@@ -137,7 +104,7 @@ type DirLog struct {
 	// used to reduce memory allocations
 	pool *sync.Pool
 	// kv is a map of keys and values
-	kv map[string][]byte
+	kv map[string]Item
 	// recordID is a current record id,
 	// incremented on every record read
 	recordID uint64
@@ -151,47 +118,13 @@ type DirLog struct {
 // if prefix is supplied, only events matching the prefix
 // will be returned, otherwise, all events will be returned
 // offset is optional and is used to locate the proper offset
-func (d *DirLog) NewWatcher(prefix []byte, offset string) (*DirWatcher, error) {
-	fsWatcher, err := fsnotify.NewWatcher()
-	if err != nil {
-		return nil, trace.ConvertSystemError(err)
-	}
-	// grab state lock to make sure we are watching the right file
-	stateFile, err := os.OpenFile(filepath.Join(d.Dir, stateFilename), os.O_RDWR|os.O_CREATE, 0600)
-	if err != nil {
-		fsWatcher.Close()
-		return nil, trace.ConvertSystemError(err)
-	}
-	defer stateFile.Close()
-	if err := fs.WriteLock(stateFile); err != nil {
-		fsWatcher.Close()
-		return nil, trace.Wrap(err)
-	}
-	defer fs.Unlock(stateFile)
-	if err := fsWatcher.Add(d.file.Name()); err != nil {
-		fsWatcher.Close()
-		return nil, trace.ConvertSystemError(err)
-	}
-	logFile, err := os.OpenFile(d.file.Name(), os.O_RDWR, 0600)
-	if err != nil {
-		fsWatcher.Close()
-		return nil, trace.ConvertSystemError(err)
-	}
-	ctx, cancel := context.WithCancel(d.Context)
-	dirWatcher := &DirWatcher{
-		Entry: log.WithFields(log.Fields{
-			trace.Component: componentLogFormat,
-		}),
-		dir:     d,
-		prefix:  prefix,
-		watcher: fsWatcher,
-		eventsC: make(chan Record),
-		cancel:  cancel,
-		ctx:     ctx,
-		logFile: logFile,
-	}
-	go dirWatcher.watch()
-	return dirWatcher, nil
+func (d *DirLog) NewWatcher(prefix []byte, offset *Offset) (*DirWatcher, error) {
+	return NewWatcher(DirWatcherConfig{
+		Dir:        d,
+		Prefix:     prefix,
+		Offset:     offset,
+		PollPeriod: d.PollPeriod,
+	})
 }
 
 // tryCompactAndReopen tries to compact the database,
@@ -242,7 +175,7 @@ func (d *DirLog) tryCompact(ctx context.Context) error {
 	defer fs.Unlock(secondFile)
 
 	// 2. catch up on all latest reads
-	if err := d.readAll(d.file, -1, d.processRecord); err != nil {
+	if err := d.readAll(d.file, -1, &d.recordID, d.processRecord); err != nil {
 		return trace.Wrap(err)
 	}
 
@@ -263,14 +196,13 @@ func (d *DirLog) tryCompact(ctx context.Context) error {
 		CurrentFile:   filepath.Base(compactedFile.Name()),
 	}
 
-	var recordID uint64
-	for key, val := range d.kv {
+	for _, item := range d.kv {
 		r := Record{
 			Type: OpCreate,
-			Key:  []byte(key),
-			Val:  val,
+			Key:  item.Key,
+			Val:  item.Val,
 		}
-		_, err := d.appendRecord(ctx, compactedFile, newState.ProcessID, &recordID, r)
+		_, err := d.appendRecord(ctx, compactedFile, newState.ProcessID, item.ID, r)
 		if err != nil {
 			return trace.Wrap(err)
 		}
@@ -279,7 +211,8 @@ func (d *DirLog) tryCompact(ctx context.Context) error {
 	// 4. append a "reopen" record to the currently active log file
 	// so that other processes that have the current log file
 	// opened, will reopen the database
-	_, err = d.appendRecord(ctx, d.file, d.state.ProcessID, &d.recordID, Record{Type: OpReopen})
+	id := atomic.AddUint64(&d.recordID, 1)
+	_, err = d.appendRecord(ctx, d.file, d.state.ProcessID, id, Record{Type: OpReopen})
 	if err != nil {
 		return trace.Wrap(err)
 	}
@@ -405,7 +338,7 @@ func (d *DirLog) newReader(f *os.File) *reader {
 func (d *DirLog) processRecord(record *walpb.Record) {
 	switch record.Operation {
 	case walpb.Operation_CREATE, walpb.Operation_UPDATE, walpb.Operation_PUT:
-		d.kv[string(record.Key)] = record.Val
+		d.kv[string(record.Key)] = Item{Key: record.Key, Val: record.Val, ID: record.ID}
 	case walpb.Operation_DELETE:
 		delete(d.kv, string(record.Key))
 	default:
@@ -415,10 +348,9 @@ func (d *DirLog) processRecord(record *walpb.Record) {
 
 type processRecord func(*walpb.Record)
 
-// readAll reads logs from the current file
-// log position up to the end, in case if limit is > 0, up to limit records
-// will be read, otherwise all records will be read up to the end
-func (d *DirLog) readAll(f *os.File, limit int, processRecord processRecord) error {
+// read reads logs from the current file log position up to the end,
+// in case if limit is > 0, up to limit records io.EOF is returned at the end of read
+func (d *DirLog) read(f *os.File, limit int, recordID *uint64, processRecord processRecord) error {
 	reader := d.newReader(f)
 	count := 0
 	for {
@@ -433,6 +365,7 @@ func (d *DirLog) readAll(f *os.File, limit int, processRecord processRecord) err
 			}
 			return trace.Wrap(err)
 		}
+		atomic.StoreUint64(recordID, record.ID)
 		if record.Operation == walpb.Operation_REOPEN {
 			return trace.Wrap(&ReopenDatabaseError{})
 		}
@@ -444,8 +377,20 @@ func (d *DirLog) readAll(f *os.File, limit int, processRecord processRecord) err
 	}
 }
 
-func (d *DirLog) Get(key string) ([]byte, error) {
-	val, err := d.tryGet(key)
+// readAll is like read, but does not return io.EOF, and returns nil instead
+func (d *DirLog) readAll(f *os.File, limit int, recordID *uint64, processRecord processRecord) error {
+	err := d.read(f, limit, recordID, processRecord)
+	if err != nil {
+		if trace.Unwrap(err) == io.EOF {
+			return nil
+		}
+		return trace.Wrap(err)
+	}
+	return nil
+}
+
+func (d *DirLog) Get(key string) (*Item, error) {
+	item, err := d.tryGet(key)
 	if err != nil {
 		if !IsReopenDatabaseError(err) {
 			return nil, trace.Wrap(err)
@@ -458,23 +403,23 @@ func (d *DirLog) Get(key string) ([]byte, error) {
 		}
 		return d.tryGet(key)
 	}
-	return val, nil
+	return item, nil
 }
 
 //
-func (d *DirLog) tryGet(key string) ([]byte, error) {
+func (d *DirLog) tryGet(key string) (*Item, error) {
 	if err := fs.ReadLock(d.file); err != nil {
 		return nil, trace.Wrap(err)
 	}
 	defer fs.Unlock(d.file)
-	if err := d.readAll(d.file, -1, d.processRecord); err != nil {
+	if err := d.readAll(d.file, -1, &d.recordID, d.processRecord); err != nil {
 		return nil, trace.Wrap(err)
 	}
-	val, ok := d.kv[key]
+	item, ok := d.kv[key]
 	if !ok {
 		return nil, trace.NotFound("key is not found")
 	}
-	return val, nil
+	return &item, nil
 }
 
 func (d *DirLog) Append(ctx context.Context, r Record) error {
@@ -503,10 +448,11 @@ func (d *DirLog) tryAppend(ctx context.Context, r Record) error {
 		return trace.Wrap(err)
 	}
 	defer fs.Unlock(d.file)
-	if err := d.readAll(d.file, -1, d.processRecord); err != nil {
+	if err := d.readAll(d.file, -1, &d.recordID, d.processRecord); err != nil {
 		return trace.Wrap(err)
 	}
-	fullRecord, err := d.appendRecord(ctx, d.file, d.state.ProcessID, &d.recordID, r)
+	id := atomic.AddUint64(&d.recordID, 1)
+	fullRecord, err := d.appendRecord(ctx, d.file, d.state.ProcessID, id, r)
 	if err != nil {
 		return trace.Wrap(err)
 	}
@@ -514,7 +460,7 @@ func (d *DirLog) tryAppend(ctx context.Context, r Record) error {
 	return nil
 }
 
-func (d *DirLog) appendRecord(ctx context.Context, f *os.File, pid uint64, recordID *uint64, r Record) (*walpb.Record, error) {
+func (d *DirLog) appendRecord(ctx context.Context, f *os.File, pid uint64, recordID uint64, r Record) (*walpb.Record, error) {
 	fullRecord, parts, err := d.split(r, pid, recordID)
 	if err != nil {
 		return nil, trace.Wrap(err)
@@ -542,16 +488,15 @@ func (d *DirLog) appendRecord(ctx context.Context, f *os.File, pid uint64, recor
 	return fullRecord, nil
 }
 
-func (d *DirLog) split(src Record, pid uint64, recordID *uint64) (*walpb.Record, []walpb.Record, error) {
+func (d *DirLog) split(src Record, pid uint64, recordID uint64) (*walpb.Record, []walpb.Record, error) {
 	op, err := src.Type.Operation()
 	if err != nil {
 		return nil, nil, trace.Wrap(err)
 	}
-	id := atomic.AddUint64(recordID, 1)
 	fullRecord := walpb.Record{
 		Operation: op,
 		ProcessID: uint64(pid),
-		ID:        id,
+		ID:        recordID,
 		Key:       src.Key,
 		Val:       src.Val,
 		LastPart:  true,
@@ -573,7 +518,7 @@ func (d *DirLog) split(src Record, pid uint64, recordID *uint64) (*walpb.Record,
 		part := walpb.Record{
 			Operation: op,
 			ProcessID: uint64(d.state.ProcessID),
-			ID:        id,
+			ID:        recordID,
 			LastPart:  false,
 			PartID:    partID,
 		}
@@ -653,7 +598,7 @@ func (m *recordMarshaler) takeRecord() *walpb.Record {
 	return r
 }
 
-func (m *recordMarshaler) accept(data []byte) error {
+func (m *recordMarshaler) accept(data []byte, offset int64) error {
 	var r walpb.Record
 	if err := r.Unmarshal(data); err != nil {
 		return trace.Wrap(err)
@@ -700,6 +645,10 @@ type reader struct {
 // in this case caller can either continue to skip to the next record
 // or break
 func (r *reader) next() (*walpb.Record, error) {
+	offset, err := r.file.Seek(0, 1)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
 	srcBytes, err := r.file.Read(r.srcBuffer)
 	if err != nil {
 		return nil, trace.Wrap(err)
@@ -711,12 +660,13 @@ func (r *reader) next() (*walpb.Record, error) {
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	if err := r.records.accept(r.dstBuffer[:dstBytes]); err != nil {
+	if err := r.records.accept(r.dstBuffer[:dstBytes], offset); err != nil {
 		return nil, trace.Wrap(err)
 	}
 	record := r.records.takeRecord()
 	if record != nil {
 		return record, nil
 	}
+
 	return nil, &PartialReadError{}
 }

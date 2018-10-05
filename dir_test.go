@@ -19,9 +19,13 @@ package lf
 import (
 	"bytes"
 	"context"
+	"os"
 	"path/filepath"
+	"testing"
+	"time"
 
 	"github.com/gravitational/trace"
+	log "github.com/sirupsen/logrus"
 	check "gopkg.in/check.v1"
 )
 
@@ -30,6 +34,13 @@ type DirSuite struct{}
 var _ = check.Suite(&DirSuite{})
 
 func (s *DirSuite) SetUpSuite(c *check.C) {
+	log.StandardLogger().Hooks = make(log.LevelHooks)
+	formatter := &trace.TextFormatter{DisableTimestamp: false}
+	log.SetFormatter(formatter)
+	if testing.Verbose() {
+		log.SetLevel(log.DebugLevel)
+		log.SetOutput(os.Stdout)
+	}
 }
 
 // TestConcurrentCRUD tests simple scenario
@@ -49,7 +60,8 @@ func (s *DirSuite) TestConcurrentCRUD(c *check.C) {
 
 	out, err := l.Get("hello")
 	c.Assert(err, check.IsNil)
-	c.Assert(out, check.DeepEquals, []byte("world"))
+	c.Assert(out.Val, check.DeepEquals, []byte("world"))
+	c.Assert(out.ID, check.Equals, uint64(1))
 
 	l2, err := NewDirLog(DirLogConfig{
 		Dir: dir,
@@ -59,7 +71,8 @@ func (s *DirSuite) TestConcurrentCRUD(c *check.C) {
 
 	out, err = l2.Get("hello")
 	c.Assert(err, check.IsNil)
-	c.Assert(out, check.DeepEquals, []byte("world"))
+	c.Assert(out.Val, check.DeepEquals, []byte("world"))
+	c.Assert(out.ID, check.Equals, uint64(1))
 
 	err = l2.Append(context.TODO(),
 		Record{Type: OpCreate, Key: []byte("another"), Val: []byte("record")})
@@ -67,7 +80,8 @@ func (s *DirSuite) TestConcurrentCRUD(c *check.C) {
 
 	out, err = l.Get("another")
 	c.Assert(err, check.IsNil)
-	c.Assert(out, check.DeepEquals, []byte("record"))
+	c.Assert(out.Val, check.DeepEquals, []byte("record"))
+	c.Assert(out.ID, check.Equals, uint64(2))
 
 	// update existing record
 	err = l.Append(context.TODO(),
@@ -76,11 +90,13 @@ func (s *DirSuite) TestConcurrentCRUD(c *check.C) {
 
 	out, err = l.Get("another")
 	c.Assert(err, check.IsNil)
-	c.Assert(out, check.DeepEquals, []byte("value 2"))
+	c.Assert(out.Val, check.DeepEquals, []byte("value 2"))
+	c.Assert(out.ID, check.Equals, uint64(3))
 
 	out, err = l2.Get("another")
 	c.Assert(err, check.IsNil)
-	c.Assert(out, check.DeepEquals, []byte("value 2"))
+	c.Assert(out.Val, check.DeepEquals, []byte("value 2"))
+	c.Assert(out.ID, check.Equals, uint64(3))
 
 	// delete a record
 	err = l.Append(context.TODO(),
@@ -131,8 +147,8 @@ func (s *DirSuite) recordSizes(c *check.C, keySize, valSize int) error {
 	if err != nil {
 		return trace.Wrap(err)
 	}
-	if !bytes.Equal(out, r.Val) {
-		return trace.CompareFailed("%v != %v", len(r.Val), len(out))
+	if !bytes.Equal(out.Val, r.Val) {
+		return trace.CompareFailed("%v != %v", len(r.Val), len(out.Val))
 	}
 	return nil
 }
@@ -197,6 +213,13 @@ func (s *DirSuite) TestRecords(c *check.C) {
 	}
 }
 
+func (s *DirSuite) expectRecord(c *check.C, l *DirLog, key string, val []byte, id uint64) {
+	out, err := l.Get(key)
+	c.Assert(err, check.IsNil)
+	c.Assert(out.Val, check.DeepEquals, val)
+	c.Assert(out.ID, check.Equals, id)
+}
+
 // TestCompaction verifies compaction and concurrent
 // operations
 func (s *DirSuite) TestCompaction(c *check.C) {
@@ -223,6 +246,10 @@ func (s *DirSuite) TestCompaction(c *check.C) {
 		Record{Type: OpCreate, Key: []byte("hello"), Val: []byte("world")})
 	c.Assert(err, check.IsNil)
 
+	err = l.Append(context.TODO(),
+		Record{Type: OpCreate, Key: []byte("another"), Val: []byte("value")})
+	c.Assert(err, check.IsNil)
+
 	// compact and reopen the database
 	err = l.tryCompactAndReopen(context.TODO())
 	c.Assert(err, check.IsNil)
@@ -230,19 +257,109 @@ func (s *DirSuite) TestCompaction(c *check.C) {
 	c.Assert(filepath.Base(l.file.Name()), check.Equals, secondLogFileName)
 	c.Assert(l.state.ProcessID, check.Equals, uint64(2))
 
-	// value should be there for both l1 and l2
-	out, err := l.Get("hello")
-	c.Assert(err, check.IsNil)
-	c.Assert(out, check.DeepEquals, []byte("world"))
+	// both values should be there for both l1 and l2
+	// and record IDs should be preserved
+	s.expectRecord(c, l, "hello", []byte("world"), 1)
+	s.expectRecord(c, l, "another", []byte("value"), 2)
 
-	out, err = l2.Get("hello")
-	c.Assert(err, check.IsNil)
-	c.Assert(out, check.DeepEquals, []byte("world"))
+	s.expectRecord(c, l2, "hello", []byte("world"), 1)
+	s.expectRecord(c, l2, "another", []byte("value"), 2)
 
 	c.Assert(filepath.Base(l2.file.Name()), check.Equals, secondLogFileName)
 	c.Assert(l2.state.ProcessID, check.Equals, uint64(3))
 }
 
-// TestRecovery recovers after data corruption
-func (s *DirSuite) TestRecovery(c *check.C) {
+// TestWatchSimple tests simple watch scenarios
+func (s *DirSuite) TestWatchSimple(c *check.C) {
+	dir := c.MkDir()
+	l, err := NewDirLog(DirLogConfig{
+		Dir:        dir,
+		PollPeriod: 10 * time.Millisecond,
+	})
+	c.Assert(err, check.IsNil)
+	defer l.Close()
+
+	watcher, err := l.NewWatcher(nil, nil)
+	c.Assert(err, check.IsNil)
+	defer watcher.Close()
+
+	record := Record{Type: OpCreate, Key: []byte("hello"), Val: []byte("world")}
+	err = l.Append(context.TODO(), record)
+	c.Assert(err, check.IsNil)
+
+	record.ID = 1
+	record.ProcessID = l.state.ProcessID
+	select {
+	case event := <-watcher.Events():
+		c.Assert(event, check.DeepEquals, record)
+	case <-time.After(time.Second):
+		c.Fatalf("timeout waiting for a record")
+	}
+
+	// start another watcher at offset
+	watcherOffset, err := l.NewWatcher(nil, &Offset{RecordID: 1})
+	c.Assert(err, check.IsNil)
+	defer watcherOffset.Close()
+
+	record = Record{Type: OpUpdate, Key: []byte("hello"), Val: []byte("there")}
+	err = l.Append(context.TODO(), record)
+	c.Assert(err, check.IsNil)
+
+	record.ID = 2
+	record.ProcessID = l.state.ProcessID
+	select {
+	case event := <-watcher.Events():
+		c.Assert(event, check.DeepEquals, record)
+	case <-time.After(time.Second):
+		c.Fatalf("timeout waiting for a record")
+	}
+
+	// watcher at offset only gets a record starting last id - 1
+	select {
+	case event := <-watcherOffset.Events():
+		c.Assert(event, check.DeepEquals, record)
+	case <-time.After(time.Second):
+		c.Fatalf("timeout waiting for a record")
+	}
+}
+
+// TestWatchCompaction test watcher behavior during compactions,
+// after the compaction occurs, watcher should receive the compaction record
+func (s *DirSuite) TestWatchCompaction(c *check.C) {
+	dir := c.MkDir()
+	l, err := NewDirLog(DirLogConfig{
+		Dir:        dir,
+		PollPeriod: 10 * time.Millisecond,
+	})
+	c.Assert(err, check.IsNil)
+	defer l.Close()
+
+	watcher, err := l.NewWatcher(nil, nil)
+	c.Assert(err, check.IsNil)
+	defer watcher.Close()
+
+	record := Record{Type: OpCreate, Key: []byte("hello"), Val: []byte("world")}
+	err = l.Append(context.TODO(), record)
+	c.Assert(err, check.IsNil)
+
+	record.ID = 1
+	record.ProcessID = l.state.ProcessID
+	select {
+	case <-watcher.Done():
+		c.Fatalf("watcher unexpectedly exited")
+	case event := <-watcher.Events():
+		c.Assert(event, check.DeepEquals, record)
+	case <-time.After(time.Second):
+		c.Fatalf("timeout waiting for a record")
+	}
+
+	err = l.tryCompactAndReopen(context.TODO())
+	c.Assert(err, check.IsNil)
+
+	// expect watcher to exit
+	select {
+	case <-watcher.Done():
+	case <-time.After(time.Second):
+		c.Fatalf("timeout waiting for watcher to exit")
+	}
 }

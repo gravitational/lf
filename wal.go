@@ -52,6 +52,17 @@ const (
 	OpReopen OpType = iota
 )
 
+// Item is a key value item
+type Item struct {
+	// Key is a key of the key value item
+	Key []byte
+	// Val is a value of the key value item
+	Val []byte
+	// ID is a record ID
+	// that is auto incremented with every operation
+	ID uint64
+}
+
 // Record is a record containing operation
 type Record struct {
 	// Type is operation type
@@ -60,6 +71,10 @@ type Record struct {
 	Key []byte
 	// Val is a value to perform operation on
 	Val []byte
+	// ProcessID is a record process id
+	ProcessID uint64
+	// ID is internal record id
+	ID uint64
 }
 
 // CheckAndSetDefaults checks record values
