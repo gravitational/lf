@@ -35,8 +35,15 @@ func (s *DirSuite) TestWatchSimple(c *check.C) {
 		c.Fatalf("timeout waiting for a record")
 	}
 
-	// start another watcher at offset
-	watcherOffset, err := l.NewWatcher(nil, &Offset{RecordID: 1})
+	// start another watcher from another backend with offset
+	l2, err := NewDirLog(DirLogConfig{
+		Dir:        dir,
+		PollPeriod: 10 * time.Millisecond,
+	})
+	c.Assert(err, check.IsNil)
+	defer l2.Close()
+
+	watcherOffset, err := l2.NewWatcher(nil, &Offset{RecordID: 1})
 	c.Assert(err, check.IsNil)
 	defer watcherOffset.Close()
 
@@ -56,6 +63,38 @@ func (s *DirSuite) TestWatchSimple(c *check.C) {
 	// watcher at offset only gets a record starting last id - 1
 	select {
 	case event := <-watcherOffset.Events():
+		c.Assert(event, check.DeepEquals, record)
+	case <-time.After(time.Second):
+		c.Fatalf("timeout waiting for a record")
+	}
+}
+
+// TestWatchPrefix tests watch scenario watching for a prefix
+func (s *DirSuite) TestWatchPrefix(c *check.C) {
+	dir := c.MkDir()
+	l, err := NewDirLog(DirLogConfig{
+		Dir:        dir,
+		PollPeriod: 10 * time.Millisecond,
+	})
+	c.Assert(err, check.IsNil)
+	defer l.Close()
+
+	watcher, err := l.NewWatcher([]byte("/test/prefix"), nil)
+	c.Assert(err, check.IsNil)
+	defer watcher.Close()
+
+	record := Record{Type: OpCreate, Key: []byte("/other/hello"), Val: []byte("world")}
+	err = l.Append(context.TODO(), record)
+	c.Assert(err, check.IsNil)
+
+	record = Record{Type: OpCreate, Key: []byte("/test/prefix"), Val: []byte("world")}
+	err = l.Append(context.TODO(), record)
+	c.Assert(err, check.IsNil)
+
+	record.ID = 2
+	record.ProcessID = l.state.ProcessID
+	select {
+	case event := <-watcher.Events():
 		c.Assert(event, check.DeepEquals, record)
 	case <-time.After(time.Second):
 		c.Fatalf("timeout waiting for a record")
