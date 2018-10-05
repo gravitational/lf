@@ -29,3 +29,8 @@ buildbox-gen:
 .PHONY: sloccount
 sloccount:
 	find . -path ./vendor -prune -o -name "*.go" -print0 | xargs -0 wc -l
+
+# bench runs benchmarks
+.PHONY: bench
+bench:
+	go test -v -check.f=Benchmark -check.b -check.bmem
