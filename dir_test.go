@@ -400,3 +400,28 @@ func (s *DirSuite) TestWatchCompaction(c *check.C) {
 		c.Fatalf("timeout waiting for a record")
 	}
 }
+
+func (d *DirSuite) BenchmarkOperations(c *check.C) {
+	dir := c.MkDir()
+	l, err := NewDirLog(DirLogConfig{
+		Dir:        dir,
+		PollPeriod: 10 * time.Millisecond,
+	})
+	c.Assert(err, check.IsNil)
+	defer l.Close()
+
+	ctx := context.TODO()
+	keys := []string{"/bench/bucket/key1", "/bench/bucket/key2", "/bench/bucket/key3", "/bench/bucket/key4", "/bench/bucket/key5"}
+	value1 := "some backend value, not large enough, but not small enough"
+	for i := 0; i < c.N; i++ {
+		for _, key := range keys {
+			err := l.Append(ctx, Record{Type: OpPut, Key: []byte(key), Val: []byte(value1)})
+			c.Assert(err, check.IsNil)
+			item, err := l.Get(key)
+			c.Assert(err, check.IsNil)
+			c.Assert(string(item.Val), check.Equals, value1)
+			err = l.Append(ctx, Record{Type: OpDelete, Key: []byte(key), Val: []byte(value1)})
+			c.Assert(err, check.IsNil)
+		}
+	}
+}
