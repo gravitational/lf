@@ -353,13 +353,50 @@ func (s *DirSuite) TestWatchCompaction(c *check.C) {
 		c.Fatalf("timeout waiting for a record")
 	}
 
-	err = l.tryCompactAndReopen(context.TODO())
+	record = Record{Type: OpUpdate, Key: []byte("hello"), Val: []byte("v2")}
+	err = l.Append(context.TODO(), record)
 	c.Assert(err, check.IsNil)
 
+	record = Record{Type: OpUpdate, Key: []byte("hello"), Val: []byte("v3")}
+	err = l.Append(context.TODO(), record)
+	c.Assert(err, check.IsNil)
+
+	for i := 0; i < 3; i++ {
+		err = l.tryCompactAndReopen(context.TODO())
+		if err == nil || !trace.IsCompareFailed(err) {
+			break
+		}
+	}
+	c.Assert(err, check.IsNil)
 	// expect watcher to exit
 	select {
 	case <-watcher.Done():
 	case <-time.After(time.Second):
 		c.Fatalf("timeout waiting for watcher to exit")
+	}
+
+	// watcher can't continue watch from record 2 because it
+	// was compacted
+	_, err = l.NewWatcher(nil, &Offset{RecordID: 2})
+	c.Assert(err, check.NotNil)
+
+	// new watcher could continue from record id 3 though
+	watcher2, err := l.NewWatcher(nil, &Offset{RecordID: 3})
+	c.Assert(err, check.IsNil)
+	defer watcher2.Close()
+
+	record = Record{Type: OpUpdate, Key: []byte("hello"), Val: []byte("v4")}
+	err = l.Append(context.TODO(), record)
+	c.Assert(err, check.IsNil)
+
+	record.ID = 4
+	record.ProcessID = l.state.ProcessID
+	select {
+	case <-watcher2.Done():
+		c.Fatalf("watcher unexpectedly exited")
+	case event := <-watcher2.Events():
+		c.Assert(event, check.DeepEquals, record)
+	case <-time.After(time.Second):
+		c.Fatalf("timeout waiting for a record")
 	}
 }
