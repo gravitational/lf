@@ -49,7 +49,8 @@ func (s *DirSuite) SetUpSuite(c *check.C) {
 func (s *DirSuite) TestConcurrentCRUD(c *check.C) {
 	dir := c.MkDir()
 	l, err := NewDirLog(DirLogConfig{
-		Dir: dir,
+		Dir:                 dir,
+		CompactionsDisabled: true,
 	})
 	c.Assert(err, check.IsNil)
 	defer l.Close()
@@ -64,7 +65,8 @@ func (s *DirSuite) TestConcurrentCRUD(c *check.C) {
 	c.Assert(out.ID, check.Equals, uint64(1))
 
 	l2, err := NewDirLog(DirLogConfig{
-		Dir: dir,
+		Dir:                 dir,
+		CompactionsDisabled: true,
 	})
 	c.Assert(err, check.IsNil)
 	defer l2.Close()
@@ -115,7 +117,8 @@ func (s *DirSuite) TestConcurrentCRUD(c *check.C) {
 func (s *DirSuite) recordSizes(c *check.C, keySize, valSize int) error {
 	dir := c.MkDir()
 	l, err := NewDirLog(DirLogConfig{
-		Dir: dir,
+		Dir:                 dir,
+		CompactionsDisabled: true,
 	})
 	c.Assert(err, check.IsNil)
 	defer l.Close()
@@ -136,7 +139,8 @@ func (s *DirSuite) recordSizes(c *check.C, keySize, valSize int) error {
 	}
 
 	l2, err := NewDirLog(DirLogConfig{
-		Dir: dir,
+		Dir:                 dir,
+		CompactionsDisabled: true,
 	})
 	if err != nil {
 		return trace.Wrap(err)
@@ -225,7 +229,8 @@ func (s *DirSuite) expectRecord(c *check.C, l *DirLog, key string, val []byte, i
 func (s *DirSuite) TestCompaction(c *check.C) {
 	dir := c.MkDir()
 	l, err := NewDirLog(DirLogConfig{
-		Dir: dir,
+		Dir:                 dir,
+		CompactionsDisabled: true,
 	})
 	c.Assert(err, check.IsNil)
 	defer l.Close()
@@ -234,7 +239,8 @@ func (s *DirSuite) TestCompaction(c *check.C) {
 	c.Assert(l.state.ProcessID, check.Equals, uint64(1))
 
 	l2, err := NewDirLog(DirLogConfig{
-		Dir: dir,
+		Dir:                 dir,
+		CompactionsDisabled: true,
 	})
 	c.Assert(err, check.IsNil)
 	defer l2.Close()
@@ -272,8 +278,9 @@ func (s *DirSuite) TestCompaction(c *check.C) {
 func (d *DirSuite) BenchmarkOperations(c *check.C) {
 	dir := c.MkDir()
 	l, err := NewDirLog(DirLogConfig{
-		Dir:        dir,
-		PollPeriod: 10 * time.Millisecond,
+		Dir:                 dir,
+		PollPeriod:          10 * time.Millisecond,
+		CompactionsDisabled: true,
 	})
 	c.Assert(err, check.IsNil)
 	defer l.Close()

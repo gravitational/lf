@@ -12,8 +12,9 @@ import (
 func (s *DirSuite) TestWatchSimple(c *check.C) {
 	dir := c.MkDir()
 	l, err := NewDirLog(DirLogConfig{
-		Dir:        dir,
-		PollPeriod: 10 * time.Millisecond,
+		Dir:                 dir,
+		PollPeriod:          10 * time.Millisecond,
+		CompactionsDisabled: true,
 	})
 	c.Assert(err, check.IsNil)
 	defer l.Close()
@@ -37,8 +38,9 @@ func (s *DirSuite) TestWatchSimple(c *check.C) {
 
 	// start another watcher from another backend with offset
 	l2, err := NewDirLog(DirLogConfig{
-		Dir:        dir,
-		PollPeriod: 10 * time.Millisecond,
+		Dir:                 dir,
+		PollPeriod:          10 * time.Millisecond,
+		CompactionsDisabled: true,
 	})
 	c.Assert(err, check.IsNil)
 	defer l2.Close()
@@ -73,8 +75,9 @@ func (s *DirSuite) TestWatchSimple(c *check.C) {
 func (s *DirSuite) TestWatchPrefix(c *check.C) {
 	dir := c.MkDir()
 	l, err := NewDirLog(DirLogConfig{
-		Dir:        dir,
-		PollPeriod: 10 * time.Millisecond,
+		Dir:                 dir,
+		PollPeriod:          10 * time.Millisecond,
+		CompactionsDisabled: true,
 	})
 	c.Assert(err, check.IsNil)
 	defer l.Close()
@@ -106,8 +109,9 @@ func (s *DirSuite) TestWatchPrefix(c *check.C) {
 func (s *DirSuite) TestWatchCompaction(c *check.C) {
 	dir := c.MkDir()
 	l, err := NewDirLog(DirLogConfig{
-		Dir:        dir,
-		PollPeriod: 10 * time.Millisecond,
+		Dir:                 dir,
+		PollPeriod:          10 * time.Millisecond,
+		CompactionsDisabled: true,
 	})
 	c.Assert(err, check.IsNil)
 	defer l.Close()

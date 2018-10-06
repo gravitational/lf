@@ -37,6 +37,8 @@ const (
 	componentLogFormat = "lf"
 	// defaultPollPeriod is a default period between polling attempts
 	defaultPollPeriod = time.Second
+	// defaultCompactionPeriod is a default period between compactions
+	defaultCompactionPeriod = 30 * time.Minute
 )
 
 // DirLogConfig holds configuration for directory
@@ -51,6 +53,10 @@ type DirLogConfig struct {
 	// PollPeriod is a period between
 	// polling attempts, used in watchers
 	PollPeriod time.Duration
+	// CompactionPeriod is a period between compactions
+	CompactionPeriod time.Duration
+	// CompactionsDisabled turns compactions off
+	CompactionsDisabled bool
 }
 
 // CheckAndSetDefaults checks and sets default values
@@ -64,6 +70,9 @@ func (cfg *DirLogConfig) CheckAndSetDefaults() error {
 	if cfg.PollPeriod == 0 {
 		cfg.PollPeriod = defaultPollPeriod
 	}
+	if cfg.CompactionPeriod == 0 {
+		cfg.CompactionPeriod = defaultCompactionPeriod
+	}
 	return nil
 }
 
@@ -74,6 +83,7 @@ func NewDirLog(cfg DirLogConfig) (*DirLog, error) {
 		return nil, trace.Wrap(err)
 	}
 	d := &DirLog{
+		Mutex: &sync.Mutex{},
 		Entry: log.WithFields(log.Fields{
 			trace.Component: componentLogFormat,
 		}),
@@ -91,10 +101,15 @@ func NewDirLog(cfg DirLogConfig) (*DirLog, error) {
 		return nil, trace.Wrap(err)
 	}
 
+	if !d.CompactionsDisabled {
+		go d.runPeriodicCompactions()
+	}
+
 	return d, nil
 }
 
 type DirLog struct {
+	*sync.Mutex
 	*log.Entry
 	DirLogConfig
 	// file is a currently opened log file
@@ -127,13 +142,48 @@ func (d *DirLog) NewWatcher(prefix []byte, offset *Offset) (*DirWatcher, error) 
 	})
 }
 
+func (d *DirLog) runPeriodicCompactions() {
+	compactionTicker := time.NewTicker(d.CompactionPeriod)
+	defer compactionTicker.Stop()
+
+	retryTicker := time.NewTicker(time.Second)
+	defer retryTicker.Stop()
+
+	var retryChannel <-chan time.Time
+compactloop:
+	for {
+		select {
+		case <-retryChannel:
+			err := d.tryCompactAndReopen(d.Context)
+			if err == nil {
+				retryChannel = nil
+				continue compactloop
+			}
+			d.Debugf("Compact and reopen failed: %v, will retry %v.", err)
+		case <-compactionTicker.C:
+			for {
+				err := d.tryCompactAndReopen(d.Context)
+				if err == nil {
+					continue compactloop
+				}
+				d.Debugf("Compact and reopen failed: %v, will retry: %v.", err)
+				retryChannel = retryTicker.C
+			}
+		case <-d.Context.Done():
+			d.Debugf("DirLog is closing, returning.")
+		}
+	}
+}
+
 // tryCompactAndReopen tries to compact the database,
 // if it succeeds, it will reopen the database
 func (d *DirLog) tryCompactAndReopen(ctx context.Context) error {
+	d.Lock()
+	defer d.Unlock()
 	if err := d.tryCompact(ctx); err != nil {
 		return trace.Wrap(err)
 	}
-	if err := d.Close(); err != nil {
+	if err := d.closeWithoutLock(); err != nil {
 		return trace.Wrap(err)
 	}
 	return d.open()
@@ -160,6 +210,7 @@ func (d *DirLog) tryCompact(ctx context.Context) error {
 	if err != nil {
 		return trace.ConvertSystemError(err)
 	}
+	defer firstFile.Close()
 	if err := fs.TryWriteLock(firstFile); err != nil {
 		return trace.Wrap(err)
 	}
@@ -169,6 +220,7 @@ func (d *DirLog) tryCompact(ctx context.Context) error {
 	if err != nil {
 		return trace.ConvertSystemError(err)
 	}
+	defer secondFile.Close()
 	if err := fs.TryWriteLock(secondFile); err != nil {
 		return trace.Wrap(err)
 	}
@@ -309,6 +361,12 @@ func (d *DirLog) open() error {
 }
 
 func (d *DirLog) Close() error {
+	d.Lock()
+	defer d.Unlock()
+	return d.closeWithoutLock()
+}
+
+func (d *DirLog) closeWithoutLock() error {
 	if d.file != nil {
 		file := d.file
 		d.file = nil
@@ -390,12 +448,14 @@ func (d *DirLog) readAll(f *os.File, limit int, recordID *uint64, processRecord 
 }
 
 func (d *DirLog) Get(key string) (*Item, error) {
+	d.Lock()
+	defer d.Unlock()
 	item, err := d.tryGet(key)
 	if err != nil {
 		if !IsReopenDatabaseError(err) {
 			return nil, trace.Wrap(err)
 		}
-		if err := d.Close(); err != nil {
+		if err := d.closeWithoutLock(); err != nil {
 			return nil, trace.Wrap(err)
 		}
 		if err := d.open(); err != nil {
@@ -423,18 +483,21 @@ func (d *DirLog) tryGet(key string) (*Item, error) {
 }
 
 func (d *DirLog) Append(ctx context.Context, r Record) error {
+	d.Lock()
+	defer d.Unlock()
+
 	err := d.tryAppend(ctx, r)
 	if err != nil {
 		if !IsReopenDatabaseError(err) {
 			return trace.Wrap(err)
 		}
-		if err := d.Close(); err != nil {
+		if err := d.closeWithoutLock(); err != nil {
 			return trace.Wrap(err)
 		}
 		if err := d.open(); err != nil {
 			return trace.Wrap(err)
 		}
-		return d.Append(ctx, r)
+		return d.tryAppend(ctx, r)
 	}
 	return nil
 }
