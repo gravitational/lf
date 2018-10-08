@@ -24,7 +24,7 @@ func (s *DirSuite) TestWatchSimple(c *check.C) {
 	defer watcher.Close()
 
 	record := Record{Type: OpCreate, Key: []byte("hello"), Val: []byte("world")}
-	err = l.Append(context.TODO(), record)
+	err = l.Append(record)
 	c.Assert(err, check.IsNil)
 
 	record.ID = 1
@@ -50,7 +50,7 @@ func (s *DirSuite) TestWatchSimple(c *check.C) {
 	defer watcherOffset.Close()
 
 	record = Record{Type: OpUpdate, Key: []byte("hello"), Val: []byte("there")}
-	err = l.Append(context.TODO(), record)
+	err = l.Append(record)
 	c.Assert(err, check.IsNil)
 
 	record.ID = 2
@@ -87,11 +87,11 @@ func (s *DirSuite) TestWatchPrefix(c *check.C) {
 	defer watcher.Close()
 
 	record := Record{Type: OpCreate, Key: []byte("/other/hello"), Val: []byte("world")}
-	err = l.Append(context.TODO(), record)
+	err = l.Append(record)
 	c.Assert(err, check.IsNil)
 
 	record = Record{Type: OpCreate, Key: []byte("/test/prefix"), Val: []byte("world")}
-	err = l.Append(context.TODO(), record)
+	err = l.Append(record)
 	c.Assert(err, check.IsNil)
 
 	record.ID = 2
@@ -121,7 +121,7 @@ func (s *DirSuite) TestWatchCompaction(c *check.C) {
 	defer watcher.Close()
 
 	record := Record{Type: OpCreate, Key: []byte("hello"), Val: []byte("world")}
-	err = l.Append(context.TODO(), record)
+	err = l.Append(record)
 	c.Assert(err, check.IsNil)
 
 	record.ID = 1
@@ -136,11 +136,11 @@ func (s *DirSuite) TestWatchCompaction(c *check.C) {
 	}
 
 	record = Record{Type: OpUpdate, Key: []byte("hello"), Val: []byte("v2")}
-	err = l.Append(context.TODO(), record)
+	err = l.Append(record)
 	c.Assert(err, check.IsNil)
 
 	record = Record{Type: OpUpdate, Key: []byte("hello"), Val: []byte("v3")}
-	err = l.Append(context.TODO(), record)
+	err = l.Append(record)
 	c.Assert(err, check.IsNil)
 
 	for i := 0; i < 3; i++ {
@@ -168,7 +168,7 @@ func (s *DirSuite) TestWatchCompaction(c *check.C) {
 	defer watcher2.Close()
 
 	record = Record{Type: OpUpdate, Key: []byte("hello"), Val: []byte("v4")}
-	err = l.Append(context.TODO(), record)
+	err = l.Append(record)
 	c.Assert(err, check.IsNil)
 
 	record.ID = 4

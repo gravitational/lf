@@ -55,11 +55,10 @@ func (s *DirSuite) TestConcurrentCRUD(c *check.C) {
 	c.Assert(err, check.IsNil)
 	defer l.Close()
 
-	err = l.Append(context.TODO(),
-		Record{Type: OpCreate, Key: []byte("hello"), Val: []byte("world")})
+	err = l.Create([]byte("hello"), []byte("world"))
 	c.Assert(err, check.IsNil)
 
-	out, err := l.Get("hello")
+	out, err := l.Get([]byte("hello"))
 	c.Assert(err, check.IsNil)
 	c.Assert(out.Val, check.DeepEquals, []byte("world"))
 	c.Assert(out.ID, check.Equals, uint64(1))
@@ -71,45 +70,121 @@ func (s *DirSuite) TestConcurrentCRUD(c *check.C) {
 	c.Assert(err, check.IsNil)
 	defer l2.Close()
 
-	out, err = l2.Get("hello")
+	out, err = l2.Get([]byte("hello"))
 	c.Assert(err, check.IsNil)
 	c.Assert(out.Val, check.DeepEquals, []byte("world"))
 	c.Assert(out.ID, check.Equals, uint64(1))
 
-	err = l2.Append(context.TODO(),
-		Record{Type: OpCreate, Key: []byte("another"), Val: []byte("record")})
+	err = l2.Create([]byte("another"), []byte("record"))
 	c.Assert(err, check.IsNil)
 
-	out, err = l.Get("another")
+	out, err = l.Get([]byte("another"))
 	c.Assert(err, check.IsNil)
 	c.Assert(out.Val, check.DeepEquals, []byte("record"))
 	c.Assert(out.ID, check.Equals, uint64(2))
 
 	// update existing record
-	err = l.Append(context.TODO(),
-		Record{Type: OpUpdate, Key: []byte("another"), Val: []byte("value 2")})
+	err = l.Update([]byte("another"), []byte("value 2"))
 	c.Assert(err, check.IsNil)
 
-	out, err = l.Get("another")
+	out, err = l.Get([]byte("another"))
 	c.Assert(err, check.IsNil)
 	c.Assert(out.Val, check.DeepEquals, []byte("value 2"))
 	c.Assert(out.ID, check.Equals, uint64(3))
 
-	out, err = l2.Get("another")
+	out, err = l2.Get([]byte("another"))
 	c.Assert(err, check.IsNil)
 	c.Assert(out.Val, check.DeepEquals, []byte("value 2"))
 	c.Assert(out.ID, check.Equals, uint64(3))
 
 	// delete a record
-	err = l.Append(context.TODO(),
-		Record{Type: OpDelete, Key: []byte("another")})
+	err = l.Delete([]byte("another"))
 	c.Assert(err, check.IsNil)
 
-	_, err = l.Get("another")
+	_, err = l.Get([]byte("another"))
 	c.Assert(trace.IsNotFound(err), check.Equals, true)
 
-	_, err = l2.Get("another")
+	_, err = l2.Get([]byte("another"))
 	c.Assert(trace.IsNotFound(err), check.Equals, true)
+
+	// concurrent create will fail
+	err = l.Create([]byte("third record"), []byte("value 3"))
+	c.Assert(err, check.IsNil)
+
+	err = l2.Create([]byte("third record"), []byte("value 4"))
+	c.Assert(trace.IsAlreadyExists(err), check.Equals, true)
+
+	err = l2.Put([]byte("third record"), []byte("value 4"))
+	c.Assert(err, check.IsNil)
+
+	out, err = l.Get([]byte("third record"))
+	c.Assert(err, check.IsNil)
+	c.Assert(out.Val, check.DeepEquals, []byte("value 4"))
+	// there were 6 operations on the database
+	c.Assert(out.ID, check.Equals, uint64(6))
+}
+
+// TestRanges tests range queries
+func (s *DirSuite) TestRanges(c *check.C) {
+	dir := c.MkDir()
+	l, err := NewDirLog(DirLogConfig{
+		Dir:                 dir,
+		CompactionsDisabled: true,
+	})
+	c.Assert(err, check.IsNil)
+	defer l.Close()
+
+	err = l.Create([]byte("/prefix/a"), []byte("val a"))
+	c.Assert(err, check.IsNil)
+
+	err = l.Create([]byte("/prefix/b"), []byte("val b"))
+	c.Assert(err, check.IsNil)
+
+	err = l.Create([]byte("/prefix/c/c1"), []byte("val c1"))
+	c.Assert(err, check.IsNil)
+
+	err = l.Create([]byte("/prefix/c/c2"), []byte("val c2"))
+	c.Assert(err, check.IsNil)
+
+	// prefix range fetch
+	result, err := l.GetRange([]byte("/prefix"), Range{MatchPrefix: true})
+	c.Assert(err, check.IsNil)
+	expected := []Item{
+		{Key: []byte("/prefix/a"), Val: []byte("val a")},
+		{Key: []byte("/prefix/b"), Val: []byte("val b")},
+		{Key: []byte("/prefix/c/c1"), Val: []byte("val c1")},
+		{Key: []byte("/prefix/c/c2"), Val: []byte("val c2")},
+	}
+	expectItems(c, result.Items, expected)
+
+	l2, err := NewDirLog(DirLogConfig{
+		Dir:                 dir,
+		CompactionsDisabled: true,
+	})
+	c.Assert(err, check.IsNil)
+	defer l2.Close()
+
+	result, err = l2.GetRange([]byte("/prefix"), Range{MatchPrefix: true})
+	expectItems(c, result.Items, expected)
+
+	// sub prefix range fetch
+	result, err = l.GetRange([]byte("/prefix/c"), Range{MatchPrefix: true})
+	c.Assert(err, check.IsNil)
+	expected = []Item{
+		{Key: []byte("/prefix/c/c1"), Val: []byte("val c1")},
+		{Key: []byte("/prefix/c/c2"), Val: []byte("val c2")},
+	}
+	expectItems(c, result.Items, expected)
+
+	result, err = l2.GetRange([]byte("/prefix/c"), Range{MatchPrefix: true})
+	expectItems(c, result.Items, expected)
+
+	// range match
+	result, err = l.GetRange([]byte("/prefix/c/c1"), Range{LessThan: []byte("/prefix/c/cz")})
+	expectItems(c, result.Items, expected)
+
+	result, err = l2.GetRange([]byte("/prefix/c/c1"), Range{LessThan: []byte("/prefix/c/cz")})
+	expectItems(c, result.Items, expected)
 }
 
 // TestLargeRecord tests scenario
@@ -133,7 +208,7 @@ func (s *DirSuite) recordSizes(c *check.C, keySize, valSize int) error {
 		r.Val[i] = byte(i % 255)
 	}
 
-	err = l.Append(context.TODO(), r)
+	err = l.Append(r)
 	if err != nil {
 		return trace.Wrap(err)
 	}
@@ -147,7 +222,7 @@ func (s *DirSuite) recordSizes(c *check.C, keySize, valSize int) error {
 	}
 	defer l2.Close()
 
-	out, err := l2.Get(string(r.Key))
+	out, err := l2.Get(r.Key)
 	if err != nil {
 		return trace.Wrap(err)
 	}
@@ -217,11 +292,21 @@ func (s *DirSuite) TestRecords(c *check.C) {
 	}
 }
 
-func (s *DirSuite) expectRecord(c *check.C, l *DirLog, key string, val []byte, id uint64) {
-	out, err := l.Get(key)
+func expectRecord(c *check.C, l *DirLog, key string, val []byte, id uint64) {
+	out, err := l.Get([]byte(key))
 	c.Assert(err, check.IsNil)
 	c.Assert(out.Val, check.DeepEquals, val)
 	c.Assert(out.ID, check.Equals, id)
+}
+
+func expectItems(c *check.C, items, expected []Item) {
+	if len(items) != len(expected) {
+		c.Fatalf("Expected %v items, got %v.", len(expected), len(items))
+	}
+	for i := range items {
+		c.Assert(string(items[i].Key), check.Equals, string(expected[i].Key))
+		c.Assert(string(items[i].Val), check.Equals, string(expected[i].Val))
+	}
 }
 
 // TestCompaction verifies compaction and concurrent
@@ -248,12 +333,10 @@ func (s *DirSuite) TestCompaction(c *check.C) {
 	c.Assert(filepath.Base(l2.file.Name()), check.Equals, firstLogFileName)
 	c.Assert(l2.state.ProcessID, check.Equals, uint64(2))
 
-	err = l.Append(context.TODO(),
-		Record{Type: OpCreate, Key: []byte("hello"), Val: []byte("world")})
+	err = l.Put([]byte("hello"), []byte("world"))
 	c.Assert(err, check.IsNil)
 
-	err = l.Append(context.TODO(),
-		Record{Type: OpCreate, Key: []byte("another"), Val: []byte("value")})
+	err = l.Put([]byte("another"), []byte("value"))
 	c.Assert(err, check.IsNil)
 
 	// compact and reopen the database
@@ -265,11 +348,11 @@ func (s *DirSuite) TestCompaction(c *check.C) {
 
 	// both values should be there for both l1 and l2
 	// and record IDs should be preserved
-	s.expectRecord(c, l, "hello", []byte("world"), 1)
-	s.expectRecord(c, l, "another", []byte("value"), 2)
+	expectRecord(c, l, "hello", []byte("world"), 1)
+	expectRecord(c, l, "another", []byte("value"), 2)
 
-	s.expectRecord(c, l2, "hello", []byte("world"), 1)
-	s.expectRecord(c, l2, "another", []byte("value"), 2)
+	expectRecord(c, l2, "hello", []byte("world"), 1)
+	expectRecord(c, l2, "another", []byte("value"), 2)
 
 	c.Assert(filepath.Base(l2.file.Name()), check.Equals, secondLogFileName)
 	c.Assert(l2.state.ProcessID, check.Equals, uint64(3))
@@ -285,17 +368,16 @@ func (d *DirSuite) BenchmarkOperations(c *check.C) {
 	c.Assert(err, check.IsNil)
 	defer l.Close()
 
-	ctx := context.TODO()
 	keys := []string{"/bench/bucket/key1", "/bench/bucket/key2", "/bench/bucket/key3", "/bench/bucket/key4", "/bench/bucket/key5"}
 	value1 := "some backend value, not large enough, but not small enough"
 	for i := 0; i < c.N; i++ {
 		for _, key := range keys {
-			err := l.Append(ctx, Record{Type: OpPut, Key: []byte(key), Val: []byte(value1)})
+			err := l.Put([]byte(key), []byte(value1))
 			c.Assert(err, check.IsNil)
-			item, err := l.Get(key)
+			item, err := l.Get([]byte(key))
 			c.Assert(err, check.IsNil)
 			c.Assert(string(item.Val), check.Equals, value1)
-			err = l.Append(ctx, Record{Type: OpDelete, Key: []byte(key), Val: []byte(value1)})
+			err = l.Delete([]byte(key))
 			c.Assert(err, check.IsNil)
 		}
 	}

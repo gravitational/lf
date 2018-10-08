@@ -68,8 +68,14 @@ type Item struct {
 // Less is used for Btree operations,
 // returns true if item is less than the other one
 func (i *Item) Less(iother btree.Item) bool {
-	other := iother.(*Item)
-	return bytes.Compare(i.Key, other.Key) < 0
+	switch other := iother.(type) {
+	case *Item:
+		return bytes.Compare(i.Key, other.Key) < 0
+	case *prefixItem:
+		return !iother.Less(i)
+	default:
+		return false
+	}
 }
 
 // Record is a record containing operation
@@ -96,6 +102,27 @@ func (r *Record) CheckAndSetDefaults() error {
 		return trace.BadParameter("missing parameter key for record type %v", r.Type)
 	}
 	return nil
+}
+
+type Options struct {
+	Prefix      bool
+	RangeEndKey []byte
+}
+
+type Option func(o *Options) error
+
+type GetResult struct {
+	Items []Item
+}
+
+// WithPrefix enables 'Get' or'Watch' requests to operate
+// on the keys with matching prefix. For example, 'Get(foo, WithPrefix())'
+// can return 'foo1', 'foo2', and so on.
+func WithPrefix() Option {
+	return func(o *Options) error {
+		o.Prefix = true
+		return nil
+	}
 }
 
 // Log is operation log, it serializes

@@ -1,6 +1,7 @@
 package lf
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"io/ioutil"
@@ -15,8 +16,8 @@ import (
 	"github.com/gravitational/lf/fs"
 	"github.com/gravitational/lf/walpb"
 
-	log "github.com/gravitational/logrus"
 	"github.com/gravitational/trace"
+	log "github.com/sirupsen/logrus"
 )
 
 const (
@@ -271,7 +272,7 @@ func (d *DirLog) tryCompact(ctx context.Context) error {
 			Key:  items[i].Key,
 			Val:  items[i].Val,
 		}
-		_, err := d.appendRecord(ctx, compactedFile, newState.ProcessID, items[i].ID, r)
+		_, err := d.appendRecord(compactedFile, newState.ProcessID, items[i].ID, r)
 		if err != nil {
 			return trace.Wrap(err)
 		}
@@ -281,7 +282,7 @@ func (d *DirLog) tryCompact(ctx context.Context) error {
 	// so that other processes that have the current log file
 	// opened, will reopen the database
 	id := atomic.AddUint64(&d.recordID, 1)
-	_, err = d.appendRecord(ctx, d.file, d.state.ProcessID, id, Record{Type: OpReopen})
+	_, err = d.appendRecord(d.file, d.state.ProcessID, id, Record{Type: OpReopen})
 	if err != nil {
 		return trace.Wrap(err)
 	}
@@ -421,6 +422,27 @@ func (d *DirLog) processRecord(record *walpb.Record) {
 	}
 }
 
+// checkOperation checks wether operation will succeed without
+// applying it to the tree
+func (d *DirLog) checkOperation(record *Record) error {
+	switch record.Type {
+	case OpCreate:
+		if d.tree.Get(&Item{Key: record.Key}) != nil {
+			return trace.AlreadyExists("record already exists")
+		}
+		return nil
+	case OpUpdate, OpDelete:
+		if d.tree.Get(&Item{Key: record.Key}) == nil {
+			return trace.AlreadyExists("record is not found")
+		}
+		return nil
+	case OpPut:
+		return nil
+	default:
+		return nil
+	}
+}
+
 type processRecord func(*walpb.Record)
 
 // read reads logs from the current file log position up to the end,
@@ -464,10 +486,68 @@ func (d *DirLog) readAll(f *os.File, limit int, recordID *uint64, processRecord 
 	return nil
 }
 
-func (d *DirLog) Get(key string) (*Item, error) {
+func (d *DirLog) Put(key []byte, val []byte) error {
+	return d.Append(Record{
+		Type: OpPut,
+		Key:  key,
+		Val:  val,
+	})
+}
+
+func (d *DirLog) Update(key []byte, val []byte) error {
+	return d.Append(Record{
+		Type: OpUpdate,
+		Key:  key,
+		Val:  val,
+	})
+}
+
+func (d *DirLog) Create(key []byte, val []byte) error {
+	return d.Append(Record{
+		Type: OpCreate,
+		Key:  key,
+		Val:  val,
+	})
+}
+
+func (d *DirLog) Delete(key []byte) error {
+	return d.Append(Record{
+		Type: OpDelete,
+		Key:  key,
+	})
+}
+
+// Get returns a single item or not found error
+func (d *DirLog) Get(key []byte) (*Item, error) {
+	r, err := d.GetRange(key, Range{})
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	if len(r.Items) == 0 {
+		return nil, trace.NotFound("item is not found")
+	}
+	return &r.Items[0], nil
+}
+
+type Range struct {
+	MatchPrefix bool
+	LessThan    []byte
+}
+
+func (r *Range) CheckAndSetDefaults() error {
+	if len(r.LessThan) != 0 && r.MatchPrefix {
+		return trace.BadParameter("either LessThan or MatchPrefix can be set at the same time")
+	}
+	return nil
+}
+
+func (d *DirLog) GetRange(key []byte, r Range) (*GetResult, error) {
+	if err := r.CheckAndSetDefaults(); err != nil {
+		return nil, trace.Wrap(err)
+	}
 	d.Lock()
 	defer d.Unlock()
-	item, err := d.tryGet(key)
+	result, err := d.tryGet(key, r)
 	if err != nil {
 		if !IsReopenDatabaseError(err) {
 			return nil, trace.Wrap(err)
@@ -478,13 +558,13 @@ func (d *DirLog) Get(key string) (*Item, error) {
 		if err := d.open(); err != nil {
 			return nil, trace.Wrap(err)
 		}
-		return d.tryGet(key)
+		return d.tryGet(key, r)
 	}
-	return item, nil
+	return result, nil
 }
 
 //
-func (d *DirLog) tryGet(key string) (*Item, error) {
+func (d *DirLog) tryGet(key []byte, r Range) (*GetResult, error) {
 	if err := fs.ReadLock(d.file); err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -492,18 +572,51 @@ func (d *DirLog) tryGet(key string) (*Item, error) {
 	if err := d.readAll(d.file, -1, &d.recordID, d.processRecord); err != nil {
 		return nil, trace.Wrap(err)
 	}
-	item := d.tree.Get(&Item{Key: []byte(key)})
-	if item == nil {
-		return nil, trace.NotFound("key is not found")
+
+	if !r.MatchPrefix && len(r.LessThan) == 0 {
+		res := &GetResult{}
+		item := d.tree.Get(&Item{Key: key})
+		if item != nil {
+			res.Items = []Item{*item.(*Item)}
+		}
+		return res, nil
 	}
-	return item.(*Item), nil
+	var rangeEnd btree.Item
+	if r.MatchPrefix {
+		rangeEnd = &prefixItem{prefix: key}
+	} else if r.LessThan != nil {
+		rangeEnd = &Item{Key: r.LessThan}
+	}
+	res := &GetResult{}
+	d.tree.AscendRange(&Item{Key: key}, rangeEnd, func(i btree.Item) bool {
+		item := i.(*Item)
+		res.Items = append(res.Items, *item)
+		return true
+	})
+	return res, nil
 }
 
-func (d *DirLog) Append(ctx context.Context, r Record) error {
+type prefixItem struct {
+	prefix []byte
+}
+
+// Less is used for Btree operations
+func (p *prefixItem) Less(iother btree.Item) bool {
+	other := iother.(*Item)
+	if bytes.HasPrefix(p.prefix, other.Key) {
+		return true
+	}
+	return false
+}
+
+func (d *DirLog) Append(r Record) error {
+	if err := r.CheckAndSetDefaults(); err != nil {
+		return trace.Wrap(err)
+	}
 	d.Lock()
 	defer d.Unlock()
 
-	err := d.tryAppend(ctx, r)
+	err := d.tryAppend(r)
 	if err != nil {
 		if !IsReopenDatabaseError(err) {
 			return trace.Wrap(err)
@@ -514,12 +627,12 @@ func (d *DirLog) Append(ctx context.Context, r Record) error {
 		if err := d.open(); err != nil {
 			return trace.Wrap(err)
 		}
-		return d.tryAppend(ctx, r)
+		return d.tryAppend(r)
 	}
 	return nil
 }
 
-func (d *DirLog) tryAppend(ctx context.Context, r Record) error {
+func (d *DirLog) tryAppend(r Record) error {
 	if err := r.CheckAndSetDefaults(); err != nil {
 		return trace.Wrap(err)
 	}
@@ -531,8 +644,12 @@ func (d *DirLog) tryAppend(ctx context.Context, r Record) error {
 	if err := d.readAll(d.file, -1, &d.recordID, d.processRecord); err != nil {
 		return trace.Wrap(err)
 	}
+	// make sure operation will succeed if applied
+	if err := d.checkOperation(&r); err != nil {
+		return trace.Wrap(err)
+	}
 	id := atomic.AddUint64(&d.recordID, 1)
-	fullRecord, err := d.appendRecord(ctx, d.file, d.state.ProcessID, id, r)
+	fullRecord, err := d.appendRecord(d.file, d.state.ProcessID, id, r)
 	if err != nil {
 		return trace.Wrap(err)
 	}
@@ -540,7 +657,7 @@ func (d *DirLog) tryAppend(ctx context.Context, r Record) error {
 	return nil
 }
 
-func (d *DirLog) appendRecord(ctx context.Context, f *os.File, pid uint64, recordID uint64, r Record) (*walpb.Record, error) {
+func (d *DirLog) appendRecord(f *os.File, pid uint64, recordID uint64, r Record) (*walpb.Record, error) {
 	fullRecord, parts, err := d.split(r, pid, recordID)
 	if err != nil {
 		return nil, trace.Wrap(err)
