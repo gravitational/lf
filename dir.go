@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/google/btree"
 	"github.com/gravitational/lf/fs"
 	"github.com/gravitational/lf/walpb"
 
@@ -39,6 +40,8 @@ const (
 	defaultPollPeriod = time.Second
 	// defaultCompactionPeriod is a default period between compactions
 	defaultCompactionPeriod = 30 * time.Minute
+	// defaultBTreeDegreee is a default degree of a B-Tree
+	defaultBTreeDegree = 8
 )
 
 // DirLogConfig holds configuration for directory
@@ -57,6 +60,9 @@ type DirLogConfig struct {
 	CompactionPeriod time.Duration
 	// CompactionsDisabled turns compactions off
 	CompactionsDisabled bool
+	// BTreeDegree is a degree of B-Tree, 2 for example, will create a
+	// 2-3-4 tree (each node contains 1-3 items and 2-4 children).
+	BTreeDegree int
 }
 
 // CheckAndSetDefaults checks and sets default values
@@ -73,6 +79,9 @@ func (cfg *DirLogConfig) CheckAndSetDefaults() error {
 	if cfg.CompactionPeriod == 0 {
 		cfg.CompactionPeriod = defaultCompactionPeriod
 	}
+	if cfg.BTreeDegree <= 0 {
+		cfg.BTreeDegree = defaultBTreeDegree
+	}
 	return nil
 }
 
@@ -82,13 +91,14 @@ func NewDirLog(cfg DirLogConfig) (*DirLog, error) {
 	if err := cfg.CheckAndSetDefaults(); err != nil {
 		return nil, trace.Wrap(err)
 	}
+
 	d := &DirLog{
 		Mutex: &sync.Mutex{},
 		Entry: log.WithFields(log.Fields{
 			trace.Component: componentLogFormat,
 		}),
 		DirLogConfig: cfg,
-		kv:           make(map[string]Item),
+		tree:         btree.New(cfg.BTreeDegree),
 		marshaler:    NewContainerMarshaler(),
 	}
 	d.pool = &sync.Pool{
@@ -118,8 +128,8 @@ type DirLog struct {
 	// re-used to marshal and unmarshal containers,
 	// used to reduce memory allocations
 	pool *sync.Pool
-	// kv is a map of keys and values
-	kv map[string]Item
+	// tree is a BTree with items
+	tree *btree.BTree
 	// recordID is a current record id,
 	// incremented on every record read
 	recordID uint64
@@ -248,13 +258,20 @@ func (d *DirLog) tryCompact(ctx context.Context) error {
 		CurrentFile:   filepath.Base(compactedFile.Name()),
 	}
 
-	for _, item := range d.kv {
+	var items []Item
+	d.tree.Descend(func(i btree.Item) bool {
+		item := i.(*Item)
+		items = append(items, *item)
+		return true
+	})
+
+	for i := range items {
 		r := Record{
 			Type: OpCreate,
-			Key:  item.Key,
-			Val:  item.Val,
+			Key:  items[i].Key,
+			Val:  items[i].Val,
 		}
-		_, err := d.appendRecord(ctx, compactedFile, newState.ProcessID, item.ID, r)
+		_, err := d.appendRecord(ctx, compactedFile, newState.ProcessID, items[i].ID, r)
 		if err != nil {
 			return trace.Wrap(err)
 		}
@@ -396,9 +413,9 @@ func (d *DirLog) newReader(f *os.File) *reader {
 func (d *DirLog) processRecord(record *walpb.Record) {
 	switch record.Operation {
 	case walpb.Operation_CREATE, walpb.Operation_UPDATE, walpb.Operation_PUT:
-		d.kv[string(record.Key)] = Item{Key: record.Key, Val: record.Val, ID: record.ID}
+		d.tree.ReplaceOrInsert(&Item{Key: record.Key, Val: record.Val, ID: record.ID})
 	case walpb.Operation_DELETE:
-		delete(d.kv, string(record.Key))
+		d.tree.Delete(&Item{Key: record.Key})
 	default:
 		// skip unsupported record
 	}
@@ -475,11 +492,11 @@ func (d *DirLog) tryGet(key string) (*Item, error) {
 	if err := d.readAll(d.file, -1, &d.recordID, d.processRecord); err != nil {
 		return nil, trace.Wrap(err)
 	}
-	item, ok := d.kv[key]
-	if !ok {
+	item := d.tree.Get(&Item{Key: []byte(key)})
+	if item == nil {
 		return nil, trace.NotFound("key is not found")
 	}
-	return &item, nil
+	return item.(*Item), nil
 }
 
 func (d *DirLog) Append(ctx context.Context, r Record) error {
