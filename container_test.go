@@ -111,7 +111,7 @@ func (s *ContainerSuite) TestDataCorruption(c *check.C) {
 			data[i] = data[i] ^ 1<<bit
 			result := make([]byte, ContainerSizeBytes)
 			_, err = m.Unmarshal(result, data)
-			c.Assert(trace.Unwrap(err), check.FitsTypeOf, &DataCorruptionError{})
+			c.Assert(trace.Unwrap(err), check.FitsTypeOf, &ChecksumError{})
 			c.Assert(IsDataCorruptionError(err), check.Equals, true)
 		}
 	}

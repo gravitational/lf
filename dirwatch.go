@@ -143,8 +143,12 @@ func (d *DirWatcher) Events() <-chan Record {
 func (d *DirWatcher) seekTo(recordID uint64) error {
 	var lastRecordID, tmp uint64
 	for {
-		err := d.Dir.read(d.logFile, 1, &tmp, func(record *walpb.Record) {
-			lastRecordID = record.ID
+		err := d.Dir.read(readParams{
+			file:          d.logFile,
+			limit:         1,
+			recordID:      &tmp,
+			processRecord: func(record *walpb.Record) { lastRecordID = record.ID },
+			repair:        false,
 		})
 		if err != nil {
 			if trace.Unwrap(err) == io.EOF {
@@ -164,21 +168,27 @@ func (d *DirWatcher) seekTo(recordID uint64) error {
 func (d *DirWatcher) readLimit(batchSize int) ([]Record, error) {
 	var records []Record
 	var recordID uint64
-	err := d.Dir.readAll(d.logFile, batchSize, &recordID, func(record *walpb.Record) {
-		op, err := FromRecordOperation(record.Operation)
-		if err != nil {
-			return
-		}
-		if op != OpReopen && len(d.Prefix) != 0 && !bytes.HasPrefix(record.Key, d.Prefix) {
-			return
-		}
-		records = append(records, Record{
-			Type:      op,
-			Key:       record.Key,
-			Val:       record.Val,
-			ProcessID: record.ProcessID,
-			ID:        record.ID,
-		})
+	err := d.Dir.readAll(readParams{
+		file:     d.logFile,
+		limit:    batchSize,
+		recordID: &recordID,
+		repair:   false,
+		processRecord: func(record *walpb.Record) {
+			op, err := FromRecordOperation(record.Operation)
+			if err != nil {
+				return
+			}
+			if op != OpReopen && len(d.Prefix) != 0 && !bytes.HasPrefix(record.Key, d.Prefix) {
+				return
+			}
+			records = append(records, Record{
+				Type:      op,
+				Key:       record.Key,
+				Val:       record.Val,
+				ProcessID: record.ProcessID,
+				ID:        record.ID,
+			})
+		},
 	})
 	if err != nil {
 		return nil, trace.Wrap(err)

@@ -94,7 +94,7 @@ func (c *ContainerMarshaler) Unmarshal(dest []byte, source []byte) (int, error) 
 	// compute checksum over data
 	computedChecksum := crc32.Checksum(source[4:], c.table)
 	if expectedChecksum != computedChecksum {
-		return -1, trace.Wrap(&DataCorruptionError{
+		return -1, trace.Wrap(&ChecksumError{
 			ExpectedChecksum: expectedChecksum,
 			ComputedChecksum: computedChecksum,
 		})

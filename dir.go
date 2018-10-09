@@ -3,6 +3,7 @@ package lf
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"io/ioutil"
 	"math"
@@ -64,6 +65,8 @@ type DirLogConfig struct {
 	// BTreeDegree is a degree of B-Tree, 2 for example, will create a
 	// 2-3-4 tree (each node contains 1-3 items and 2-4 children).
 	BTreeDegree int
+	// Repair launches repair operation on database open
+	Repair bool
 }
 
 // CheckAndSetDefaults checks and sets default values
@@ -109,6 +112,15 @@ func NewDirLog(cfg DirLogConfig) (*DirLog, error) {
 	}
 
 	if err := d.open(); err != nil {
+		return nil, trace.Wrap(err)
+	}
+
+	if d.Repair {
+		if err := d.tryRepairAndReopen(cfg.Context); err != nil {
+			return nil, trace.Wrap(err)
+		}
+	}
+	if err := d.readFull(); err != nil {
 		return nil, trace.Wrap(err)
 	}
 
@@ -191,7 +203,21 @@ compactloop:
 func (d *DirLog) tryCompactAndReopen(ctx context.Context) error {
 	d.Lock()
 	defer d.Unlock()
-	if err := d.tryCompact(ctx); err != nil {
+	if err := d.tryCompact(ctx, false); err != nil {
+		return trace.Wrap(err)
+	}
+	if err := d.closeWithoutLock(); err != nil {
+		return trace.Wrap(err)
+	}
+	return d.open()
+}
+
+// tryRepairAndReopen, will attempt to repair the database
+// if it succeeds, it will reopen the database
+func (d *DirLog) tryRepairAndReopen(ctx context.Context) error {
+	d.Lock()
+	defer d.Unlock()
+	if err := d.tryCompact(ctx, true); err != nil {
 		return trace.Wrap(err)
 	}
 	if err := d.closeWithoutLock(); err != nil {
@@ -205,7 +231,7 @@ func (d *DirLog) tryCompactAndReopen(ctx context.Context) error {
 // to grab multiple files at once)
 // tryCompact assumes that the database is opened
 // by this dir log
-func (d *DirLog) tryCompact(ctx context.Context) error {
+func (d *DirLog) tryCompact(ctx context.Context, repair bool) error {
 	// 1. grab write locks on state file and both log files
 	stateFile, err := os.OpenFile(filepath.Join(d.Dir, stateFilename), os.O_RDWR|os.O_CREATE, 0600)
 	if err != nil {
@@ -238,7 +264,14 @@ func (d *DirLog) tryCompact(ctx context.Context) error {
 	defer fs.Unlock(secondFile)
 
 	// 2. catch up on all latest reads
-	if err := d.readAll(d.file, -1, &d.recordID, d.processRecord); err != nil {
+	err = d.readAll(readParams{
+		file:          d.file,
+		limit:         -1,
+		recordID:      &d.recordID,
+		processRecord: d.processRecord,
+		repair:        repair,
+	})
+	if err != nil {
 		return trace.Wrap(err)
 	}
 
@@ -260,19 +293,25 @@ func (d *DirLog) tryCompact(ctx context.Context) error {
 	}
 
 	var items []Item
-	d.tree.Descend(func(i btree.Item) bool {
+	d.tree.Ascend(func(i btree.Item) bool {
 		item := i.(*Item)
 		items = append(items, *item)
 		return true
 	})
 
+	var newID uint64
 	for i := range items {
 		r := Record{
 			Type: OpCreate,
 			Key:  items[i].Key,
 			Val:  items[i].Val,
 		}
-		_, err := d.appendRecord(compactedFile, newState.ProcessID, items[i].ID, r)
+		newID += 1
+		useID := items[i].ID
+		if repair {
+			useID = newID
+		}
+		_, err := d.appendRecord(compactedFile, newState.ProcessID, useID, r)
 		if err != nil {
 			return trace.Wrap(err)
 		}
@@ -393,20 +432,27 @@ func (d *DirLog) closeWithoutLock() error {
 	return nil
 }
 
-func (d *DirLog) newReader(f *os.File) *reader {
+func (d *DirLog) newReader(f *os.File, repair bool) reader {
 	srcBuffer := d.pool.Get().([]byte)
 	defer d.pool.Put(zero(srcBuffer))
 
 	dstBuffer := d.pool.Get().([]byte)
 	defer d.pool.Put(zero(dstBuffer))
 
-	records := &recordMarshaler{}
-
-	return &reader{
+	if repair {
+		return &repairReader{
+			file:      f,
+			srcBuffer: srcBuffer,
+			dstBuffer: dstBuffer,
+			records:   &repairMarshaler{},
+			marshaler: d.marshaler,
+		}
+	}
+	return &strictReader{
 		file:      f,
 		srcBuffer: srcBuffer,
 		dstBuffer: dstBuffer,
-		records:   records,
+		records:   &recordMarshaler{},
 		marshaler: d.marshaler,
 	}
 }
@@ -445,10 +491,18 @@ func (d *DirLog) checkOperation(record *Record) error {
 
 type processRecord func(*walpb.Record)
 
+type readParams struct {
+	file          *os.File
+	limit         int
+	recordID      *uint64
+	processRecord processRecord
+	repair        bool
+}
+
 // read reads logs from the current file log position up to the end,
 // in case if limit is > 0, up to limit records io.EOF is returned at the end of read
-func (d *DirLog) read(f *os.File, limit int, recordID *uint64, processRecord processRecord) error {
-	reader := d.newReader(f)
+func (d *DirLog) read(p readParams) error {
+	reader := d.newReader(p.file, p.repair)
 	count := 0
 	for {
 		record, err := reader.next()
@@ -462,21 +516,21 @@ func (d *DirLog) read(f *os.File, limit int, recordID *uint64, processRecord pro
 			}
 			return trace.Wrap(err)
 		}
-		atomic.StoreUint64(recordID, record.ID)
+		atomic.StoreUint64(p.recordID, record.ID)
 		if record.Operation == walpb.Operation_REOPEN {
 			return trace.Wrap(&ReopenDatabaseError{})
 		}
-		processRecord(record)
+		p.processRecord(record)
 		count += 1
-		if limit > 0 && count >= limit {
+		if p.limit > 0 && count >= p.limit {
 			return nil
 		}
 	}
 }
 
 // readAll is like read, but does not return io.EOF, and returns nil instead
-func (d *DirLog) readAll(f *os.File, limit int, recordID *uint64, processRecord processRecord) error {
-	err := d.read(f, limit, recordID, processRecord)
+func (d *DirLog) readAll(p readParams) error {
+	err := d.read(p)
 	if err != nil {
 		if trace.Unwrap(err) == io.EOF {
 			return nil
@@ -563,13 +617,24 @@ func (d *DirLog) GetRange(key []byte, r Range) (*GetResult, error) {
 	return result, nil
 }
 
+func (d *DirLog) readFull() error {
+	if err := fs.ReadLock(d.file); err != nil {
+		return trace.Wrap(err)
+	}
+	defer fs.Unlock(d.file)
+	if err := d.readAll(readParams{file: d.file, limit: -1, recordID: &d.recordID, processRecord: d.processRecord, repair: false}); err != nil {
+		return trace.Wrap(err)
+	}
+	return nil
+}
+
 //
 func (d *DirLog) tryGet(key []byte, r Range) (*GetResult, error) {
 	if err := fs.ReadLock(d.file); err != nil {
 		return nil, trace.Wrap(err)
 	}
 	defer fs.Unlock(d.file)
-	if err := d.readAll(d.file, -1, &d.recordID, d.processRecord); err != nil {
+	if err := d.readAll(readParams{file: d.file, limit: -1, recordID: &d.recordID, processRecord: d.processRecord, repair: false}); err != nil {
 		return nil, trace.Wrap(err)
 	}
 
@@ -641,7 +706,7 @@ func (d *DirLog) tryAppend(r Record) error {
 		return trace.Wrap(err)
 	}
 	defer fs.Unlock(d.file)
-	if err := d.readAll(d.file, -1, &d.recordID, d.processRecord); err != nil {
+	if err := d.readAll(readParams{file: d.file, limit: -1, recordID: &d.recordID, processRecord: d.processRecord, repair: false}); err != nil {
 		return trace.Wrap(err)
 	}
 	// make sure operation will succeed if applied
@@ -795,12 +860,16 @@ func (m *recordMarshaler) takeRecord() *walpb.Record {
 	return r
 }
 
-func (m *recordMarshaler) accept(data []byte, offset int64) error {
+func (m *recordMarshaler) accept(data []byte) error {
 	var r walpb.Record
 	if err := r.Unmarshal(data); err != nil {
 		return trace.Wrap(err)
 	}
 	if m.current == nil {
+		// first record, but not a first part ID,
+		if r.PartID != 0 {
+			return trace.BadParameter("first record, but not a first part ID: %v", r.PartID)
+		}
 		m.current = &r
 		return nil
 	}
@@ -827,7 +896,14 @@ func (m *recordMarshaler) accept(data []byte, offset int64) error {
 	return nil
 }
 
-type reader struct {
+// reader is a wal log reader interface
+type reader interface {
+	// next returns the next record from the
+	// wal log
+	next() (*walpb.Record, error)
+}
+
+type strictReader struct {
 	file      *os.File
 	srcBuffer []byte
 	dstBuffer []byte
@@ -841,23 +917,149 @@ type reader struct {
 // next again, or error indicating unmarshaling error or data corruption,
 // in this case caller can either continue to skip to the next record
 // or break
-func (r *reader) next() (*walpb.Record, error) {
-	offset, err := r.file.Seek(0, 1)
-	if err != nil {
-		return nil, trace.Wrap(err)
-	}
+func (r *strictReader) next() (*walpb.Record, error) {
 	srcBytes, err := r.file.Read(r.srcBuffer)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
 	if srcBytes != ContainerSizeBytes {
-		return nil, trace.BadParameter("short read: %v bytes instead of expected %v", srcBytes, ContainerSizeBytes)
+		return nil, &LogReadError{
+			Message: fmt.Sprintf("short read: %v bytes instead of expected %v", srcBytes, ContainerSizeBytes),
+		}
 	}
 	dstBytes, err := r.marshaler.Unmarshal(r.dstBuffer, r.srcBuffer)
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
-	if err := r.records.accept(r.dstBuffer[:dstBytes], offset); err != nil {
+	if err := r.records.accept(r.dstBuffer[:dstBytes]); err != nil {
+		return nil, trace.Wrap(err)
+	}
+	record := r.records.takeRecord()
+	if record != nil {
+		return record, nil
+	}
+
+	return nil, &PartialReadError{}
+}
+
+type repairMarshaler struct {
+	// current record that is being assembled
+	current *walpb.Record
+	// skipID is set when repair marshaler
+	// is set to skip all records of a given ID
+	skipID uint64
+}
+
+func (m *repairMarshaler) takeRecord() *walpb.Record {
+	if m.current == nil || !m.current.LastPart {
+		return nil
+	}
+	r := m.current
+	m.current = nil
+	return r
+}
+
+func (m *repairMarshaler) setSkipID(skipID uint64) {
+	if m.skipID < skipID {
+		m.skipID = skipID
+	}
+}
+
+func (m *repairMarshaler) accept(data []byte) error {
+	var r walpb.Record
+	if err := r.Unmarshal(data); err != nil {
+		if m.current != nil {
+			// skip all records that have id <= this id
+			m.setSkipID(m.current.ID)
+			m.current = nil
+		}
+		return nil
+	}
+	if r.ID <= m.skipID {
+		return nil
+	}
+	if m.current == nil {
+		// first record, but not a first part ID,
+		// skip this record
+		if r.PartID != 0 {
+			m.setSkipID(r.ID)
+			return nil
+		}
+		m.current = &r
+		return nil
+	}
+	if m.current.LastPart {
+		return trace.BadParameter("take a complete record before accepting a new one")
+	}
+	// this is the record written by some other process,
+	// skip both records (whatever record has bigger ID)
+	if r.ProcessID != m.current.ProcessID || r.ID != m.current.ID {
+		m.setSkipID(r.ID)
+		m.setSkipID(m.current.ID)
+		m.current = nil
+		return nil
+	}
+	// out of order part, skip this record
+	if r.PartID != m.current.PartID+1 {
+		m.current = nil
+		m.setSkipID(r.ID)
+		return nil
+	}
+	if len(r.Key) != 0 {
+		m.current.Key = append(m.current.Key, r.Key...)
+	}
+	if len(r.Val) != 0 {
+		m.current.Val = append(m.current.Val, r.Val...)
+	}
+	m.current.PartID = r.PartID
+	m.current.LastPart = r.LastPart
+	return nil
+}
+
+type repairReader struct {
+	file      *os.File
+	srcBuffer []byte
+	dstBuffer []byte
+	records   *repairMarshaler
+	marshaler *ContainerMarshaler
+}
+
+// next returns full record or error otherwise,
+// error could be EOF in case if end of file reached
+// or partial record read, in this case caller is expected to call
+// next again, or error indicating unmarshaling error or data corruption,
+// in this case caller can either continue to skip to the next record
+// or break
+func (r *repairReader) next() (*walpb.Record, error) {
+	srcBytes, err := r.file.Read(r.srcBuffer)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	if srcBytes != ContainerSizeBytes {
+		// short reads are only OK if at the end of file
+		fi, err := r.file.Stat()
+		if err != nil {
+			return nil, trace.ConvertSystemError(err)
+		}
+		offset, err := r.file.Seek(0, 1)
+		if err != nil {
+			return nil, trace.ConvertSystemError(err)
+		}
+		// if at the end of file, skip the record
+		if offset == fi.Size() {
+			return nil, &PartialReadError{}
+		}
+		// otherwise, error is unkown,
+		// not sure what to do
+		return nil, trace.BadParameter("short read: %v bytes instead of expected %v", srcBytes, ContainerSizeBytes)
+	}
+	// skip failures to unmarshal, repair marshaler will skip
+	// unsupported records
+	dstBytes, err := r.marshaler.Unmarshal(r.dstBuffer, r.srcBuffer)
+	if err != nil {
+		return nil, &PartialReadError{}
+	}
+	if err := r.records.accept(r.dstBuffer[:dstBytes]); err != nil {
 		return nil, trace.Wrap(err)
 	}
 	record := r.records.takeRecord()

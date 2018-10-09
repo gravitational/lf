@@ -6,8 +6,8 @@ import (
 	"github.com/gravitational/trace"
 )
 
-// DataCorruptionError indicates that data has been corrupted
-type DataCorruptionError struct {
+// ChecksumError indicates that data has been corrupted
+type ChecksumError struct {
 	// ExpectedChecksum is an expected checksum value
 	ExpectedChecksum uint32
 	// ComputedChecksum is a computed checksum value
@@ -15,15 +15,29 @@ type DataCorruptionError struct {
 }
 
 // Error returns a formatted user-friendly message
-func (e DataCorruptionError) Error() string {
+func (e ChecksumError) Error() string {
 	return fmt.Sprintf("checksum mismatch, expected checksum %v != computed checksum %v",
 		e.ExpectedChecksum, e.ComputedChecksum)
 }
 
+// LogReadError indicates that data has been corrupted,
+// and reader could not read the log
+type LogReadError struct {
+	Message string
+}
+
+// Error returns a formatted user-friendly message
+func (e LogReadError) Error() string {
+	return e.Message
+}
+
 // IsDataCorruptionError returns true if given error is data corruption error
 func IsDataCorruptionError(e error) bool {
-	_, ok := trace.Unwrap(e).(*DataCorruptionError)
-	return ok
+	switch trace.Unwrap(e).(type) {
+	case *ChecksumError, *LogReadError:
+		return true
+	}
+	return false
 }
 
 // CompactionRequiredError indicates that log requires compaction

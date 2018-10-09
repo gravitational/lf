@@ -382,3 +382,235 @@ func (d *DirSuite) BenchmarkOperations(c *check.C) {
 		}
 	}
 }
+
+// TestRepairCreate tests repair operation in case if the first value
+// used to create a value have been corrupted
+func (s *DirSuite) TestRepairCreate(c *check.C) {
+	dir := c.MkDir()
+	l, err := NewDirLog(DirLogConfig{
+		Dir:                 dir,
+		CompactionsDisabled: true,
+	})
+	c.Assert(err, check.IsNil)
+	defer l.Close()
+
+	err = l.Create([]byte("hello"), []byte("world"))
+	c.Assert(err, check.IsNil)
+
+	err = l.Update([]byte("hello"), []byte("value 2"))
+	c.Assert(err, check.IsNil)
+
+	err = l.Put([]byte("hello2"), []byte("value 3"))
+	c.Assert(err, check.IsNil)
+
+	_, err = l.file.Seek(400, 0)
+	c.Assert(err, check.IsNil)
+
+	_, err = l.file.Write([]byte("damage!"))
+	c.Assert(err, check.IsNil)
+
+	l.Close()
+	_, err = NewDirLog(DirLogConfig{
+		Dir:                 dir,
+		CompactionsDisabled: true,
+	})
+	c.Assert(IsDataCorruptionError(err), check.Equals, true)
+
+	l, err = NewDirLog(DirLogConfig{
+		Dir:                 dir,
+		CompactionsDisabled: true,
+	})
+	c.Assert(IsDataCorruptionError(err), check.Equals, true)
+
+	// initiate repair procedure
+	l, err = NewDirLog(DirLogConfig{
+		Dir:                 dir,
+		CompactionsDisabled: true,
+		Repair:              true,
+	})
+	c.Assert(err, check.IsNil)
+
+	// after repair, value 2 is preserved, however record IDs have been shifted
+	// because repair rewrote the history and renumbered IDs
+	out, err := l.Get([]byte("hello"))
+	c.Assert(err, check.IsNil)
+	c.Assert(string(out.Val), check.Equals, "value 2")
+	c.Assert(out.ID, check.Equals, uint64(1))
+
+	out, err = l.Get([]byte("hello2"))
+	c.Assert(err, check.IsNil)
+	c.Assert(string(out.Val), check.Equals, "value 3")
+	c.Assert(out.ID, check.Equals, uint64(2))
+}
+
+// TestRepairShortWrite tests repair operation in case if the last value
+// was not written in full
+func (s *DirSuite) TestRepairShortWrite(c *check.C) {
+	dir := c.MkDir()
+	l, err := NewDirLog(DirLogConfig{
+		Dir:                 dir,
+		CompactionsDisabled: true,
+	})
+	c.Assert(err, check.IsNil)
+	defer l.Close()
+
+	err = l.Create([]byte("hello"), []byte("world"))
+	c.Assert(err, check.IsNil)
+
+	err = l.Update([]byte("hello"), []byte("value 2"))
+	c.Assert(err, check.IsNil)
+
+	err = l.Put([]byte("hello2"), []byte("value 3"))
+	c.Assert(err, check.IsNil)
+
+	fi, err := l.file.Stat()
+	c.Assert(err, check.IsNil)
+
+	err = l.file.Truncate(fi.Size() - 1)
+	c.Assert(err, check.IsNil)
+	l.Close()
+
+	_, err = NewDirLog(DirLogConfig{
+		Dir:                 dir,
+		CompactionsDisabled: true,
+	})
+	c.Assert(IsDataCorruptionError(err), check.Equals, true)
+
+	l, err = NewDirLog(DirLogConfig{
+		Dir:                 dir,
+		CompactionsDisabled: true,
+	})
+	c.Assert(IsDataCorruptionError(err), check.Equals, true)
+
+	// initiate repair procedure
+	l, err = NewDirLog(DirLogConfig{
+		Dir:                 dir,
+		CompactionsDisabled: true,
+		Repair:              true,
+	})
+	c.Assert(err, check.IsNil)
+
+	// after repair, value 2 is preserved, however record IDs have been shifted
+	// because repair rewrote the history and renumbered IDs
+	out, err := l.Get([]byte("hello"))
+	c.Assert(err, check.IsNil)
+	c.Assert(string(out.Val), check.Equals, "value 2")
+	c.Assert(out.ID, check.Equals, uint64(1))
+
+	// value 3 is lost
+	_, err = l.Get([]byte("hello2"))
+	c.Assert(trace.IsNotFound(err), check.Equals, true)
+}
+
+func makeVal(length int) []byte {
+	out := make([]byte, length)
+	for i := 0; i < length; i++ {
+		out[i] = byte(i % 255)
+	}
+	return out
+}
+
+type repairCase struct {
+	info            string
+	keySize         int
+	valSize         int
+	corruptAtOffset int
+	corruptData     []byte
+}
+
+// TestRepairLargeRecord tests scenario when
+// a record is damaged in the start, middle and end
+func (s *DirSuite) TestRepairLargeRecord(c *check.C) {
+	testCases := []repairCase{
+		{
+			info:            "corrupted first record",
+			keySize:         ContainerSizeBytes * 3,
+			valSize:         ContainerSizeBytes*3 + 1,
+			corruptAtOffset: ContainerSizeBytes + 1,
+			corruptData:     []byte("damage"),
+		},
+		{
+			info:            "corrupted middle",
+			keySize:         ContainerSizeBytes * 3,
+			valSize:         ContainerSizeBytes*3 + 1,
+			corruptAtOffset: ContainerSizeBytes*2 + 1,
+			corruptData:     []byte("damage"),
+		},
+		{
+			info:            "corrupted value",
+			keySize:         ContainerSizeBytes * 3,
+			valSize:         ContainerSizeBytes*3 + 1,
+			corruptAtOffset: ContainerSizeBytes*5 + 1,
+			corruptData:     []byte("damage"),
+		},
+	}
+	for _, tc := range testCases {
+		s.repairLargeRecord(c, tc)
+	}
+}
+
+func (s *DirSuite) repairLargeRecord(c *check.C, tc repairCase) {
+	dir := c.MkDir()
+	l, err := NewDirLog(DirLogConfig{
+		Dir:                 dir,
+		CompactionsDisabled: true,
+	})
+	c.Assert(err, check.IsNil)
+	defer l.Close()
+
+	key := makeVal(tc.keySize)
+	val := makeVal(tc.valSize)
+
+	// first, put a small record
+	err = l.Put([]byte("a"), []byte("a val"))
+	c.Assert(err, check.IsNil)
+
+	err = l.Create(key, val)
+	c.Assert(err, check.IsNil)
+
+	err = l.Put([]byte("b"), []byte("b val"))
+	c.Assert(err, check.IsNil)
+
+	_, err = l.file.Seek(int64(tc.corruptAtOffset), 0)
+	c.Assert(err, check.IsNil)
+
+	_, err = l.file.Write(tc.corruptData)
+	c.Assert(err, check.IsNil)
+
+	l.Close()
+
+	_, err = NewDirLog(DirLogConfig{
+		Dir:                 dir,
+		CompactionsDisabled: true,
+	})
+	c.Assert(IsDataCorruptionError(err), check.Equals, true)
+
+	l, err = NewDirLog(DirLogConfig{
+		Dir:                 dir,
+		CompactionsDisabled: true,
+	})
+	c.Assert(IsDataCorruptionError(err), check.Equals, true)
+
+	// initiate repair procedure
+	l, err = NewDirLog(DirLogConfig{
+		Dir:                 dir,
+		CompactionsDisabled: true,
+		Repair:              true,
+	})
+	c.Assert(err, check.IsNil)
+
+	// after repair, values 1 and 3 are preserved
+	out, err := l.Get([]byte("a"))
+	c.Assert(err, check.IsNil)
+	c.Assert(string(out.Val), check.Equals, "a val")
+	c.Assert(out.ID, check.Equals, uint64(1))
+
+	out, err = l.Get([]byte("b"))
+	c.Assert(err, check.IsNil)
+	c.Assert(string(out.Val), check.Equals, "b val")
+	c.Assert(out.ID, check.Equals, uint64(2))
+
+	// value 3 is lost
+	_, err = l.Get(key)
+	c.Assert(trace.IsNotFound(err), check.Equals, true)
+}
