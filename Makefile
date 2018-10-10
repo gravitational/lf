@@ -33,7 +33,7 @@ sloccount:
 # bench runs benchmarks
 .PHONY: bench
 bench:
-	go test -v -check.f=Benchmark -check.b -check.bmem
+	go test ./lf -v -check.f=Benchmark -check.b -check.bmem
 
 .PHONY: cover
 cover:
