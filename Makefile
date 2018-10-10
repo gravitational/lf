@@ -34,3 +34,9 @@ sloccount:
 .PHONY: bench
 bench:
 	go test -v -check.f=Benchmark -check.b -check.bmem
+
+.PHONY: cover
+cover:
+	go test . -coverprofile=cover.out
+	go tool cover -html=cover.out
+

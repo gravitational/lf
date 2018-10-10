@@ -495,11 +495,34 @@ func (d *DirLog) processRecord(record *walpb.Record) {
 		if record.Expires != 0 {
 			item.Expires = time.Unix(record.Expires, 0)
 		}
-		if item.Expires.IsZero() || d.Clock.Now().Before(item.Expires) {
-			if !item.Expires.IsZero() {
+		treeItem := d.tree.Get(&Item{Key: record.Key})
+		var existingItem *Item
+		if treeItem != nil {
+			existingItem = treeItem.(*Item)
+		}
+		switch {
+		case item.Expires.IsZero():
+			// new item is added, it does not expire,
+			if existingItem != nil && existingItem.index >= 0 {
+				// new item replaces the existing item that should be removed
+				// from the heap
+				d.heap.RemoveEl(existingItem)
+			}
+			d.tree.ReplaceOrInsert(item)
+		case d.Clock.Now().Before(item.Expires):
+			// new item is added, but it has not expired yet
+			if existingItem != nil {
+				// existing item should be updated on the heap
+				if existingItem.index >= 0 {
+					d.heap.UpdateEl(existingItem, item.Expires)
+				}
+			} else {
+				// new item should be added on the heap
 				d.heap.PushEl(item)
 			}
 			d.tree.ReplaceOrInsert(item)
+		default:
+			// skip adding or updating the item that has expired
 		}
 	case walpb.Operation_DELETE:
 		treeItem := d.tree.Get(&Item{Key: record.Key})
@@ -527,7 +550,7 @@ func (d *DirLog) checkOperation(record *Record) error {
 		return nil
 	case OpUpdate, OpDelete:
 		if d.tree.Get(&Item{Key: record.Key}) == nil {
-			return trace.AlreadyExists("record is not found")
+			return trace.NotFound("record is not found")
 		}
 		return nil
 	case OpPut:
