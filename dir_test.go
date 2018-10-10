@@ -55,7 +55,7 @@ func (s *DirSuite) TestConcurrentCRUD(c *check.C) {
 	c.Assert(err, check.IsNil)
 	defer l.Close()
 
-	err = l.Create([]byte("hello"), []byte("world"))
+	err = l.Create(Item{Key: []byte("hello"), Val: []byte("world")})
 	c.Assert(err, check.IsNil)
 
 	out, err := l.Get([]byte("hello"))
@@ -75,7 +75,7 @@ func (s *DirSuite) TestConcurrentCRUD(c *check.C) {
 	c.Assert(out.Val, check.DeepEquals, []byte("world"))
 	c.Assert(out.ID, check.Equals, uint64(1))
 
-	err = l2.Create([]byte("another"), []byte("record"))
+	err = l2.Create(Item{Key: []byte("another"), Val: []byte("record")})
 	c.Assert(err, check.IsNil)
 
 	out, err = l.Get([]byte("another"))
@@ -84,7 +84,7 @@ func (s *DirSuite) TestConcurrentCRUD(c *check.C) {
 	c.Assert(out.ID, check.Equals, uint64(2))
 
 	// update existing record
-	err = l.Update([]byte("another"), []byte("value 2"))
+	err = l.Update(Item{Key: []byte("another"), Val: []byte("value 2")})
 	c.Assert(err, check.IsNil)
 
 	out, err = l.Get([]byte("another"))
@@ -108,13 +108,13 @@ func (s *DirSuite) TestConcurrentCRUD(c *check.C) {
 	c.Assert(trace.IsNotFound(err), check.Equals, true)
 
 	// concurrent create will fail
-	err = l.Create([]byte("third record"), []byte("value 3"))
+	err = l.Create(Item{Key: []byte("third record"), Val: []byte("value 3")})
 	c.Assert(err, check.IsNil)
 
-	err = l2.Create([]byte("third record"), []byte("value 4"))
+	err = l2.Create(Item{Key: []byte("third record"), Val: []byte("value 4")})
 	c.Assert(trace.IsAlreadyExists(err), check.Equals, true)
 
-	err = l2.Put([]byte("third record"), []byte("value 4"))
+	err = l2.Put(Item{Key: []byte("third record"), Val: []byte("value 4")})
 	c.Assert(err, check.IsNil)
 
 	out, err = l.Get([]byte("third record"))
@@ -134,16 +134,16 @@ func (s *DirSuite) TestRanges(c *check.C) {
 	c.Assert(err, check.IsNil)
 	defer l.Close()
 
-	err = l.Create([]byte("/prefix/a"), []byte("val a"))
+	err = l.Create(Item{Key: []byte("/prefix/a"), Val: []byte("val a")})
 	c.Assert(err, check.IsNil)
 
-	err = l.Create([]byte("/prefix/b"), []byte("val b"))
+	err = l.Create(Item{Key: []byte("/prefix/b"), Val: []byte("val b")})
 	c.Assert(err, check.IsNil)
 
-	err = l.Create([]byte("/prefix/c/c1"), []byte("val c1"))
+	err = l.Create(Item{Key: []byte("/prefix/c/c1"), Val: []byte("val c1")})
 	c.Assert(err, check.IsNil)
 
-	err = l.Create([]byte("/prefix/c/c2"), []byte("val c2"))
+	err = l.Create(Item{Key: []byte("/prefix/c/c2"), Val: []byte("val c2")})
 	c.Assert(err, check.IsNil)
 
 	// prefix range fetch
@@ -333,10 +333,10 @@ func (s *DirSuite) TestCompaction(c *check.C) {
 	c.Assert(filepath.Base(l2.file.Name()), check.Equals, firstLogFileName)
 	c.Assert(l2.state.ProcessID, check.Equals, uint64(2))
 
-	err = l.Put([]byte("hello"), []byte("world"))
+	err = l.Put(Item{Key: []byte("hello"), Val: []byte("world")})
 	c.Assert(err, check.IsNil)
 
-	err = l.Put([]byte("another"), []byte("value"))
+	err = l.Put(Item{Key: []byte("another"), Val: []byte("value")})
 	c.Assert(err, check.IsNil)
 
 	// compact and reopen the database
@@ -372,7 +372,7 @@ func (d *DirSuite) BenchmarkOperations(c *check.C) {
 	value1 := "some backend value, not large enough, but not small enough"
 	for i := 0; i < c.N; i++ {
 		for _, key := range keys {
-			err := l.Put([]byte(key), []byte(value1))
+			err := l.Put(Item{Key: []byte(key), Val: []byte(value1)})
 			c.Assert(err, check.IsNil)
 			item, err := l.Get([]byte(key))
 			c.Assert(err, check.IsNil)
@@ -394,13 +394,13 @@ func (s *DirSuite) TestRepairCreate(c *check.C) {
 	c.Assert(err, check.IsNil)
 	defer l.Close()
 
-	err = l.Create([]byte("hello"), []byte("world"))
+	err = l.Create(Item{Key: []byte("hello"), Val: []byte("world")})
 	c.Assert(err, check.IsNil)
 
-	err = l.Update([]byte("hello"), []byte("value 2"))
+	err = l.Update(Item{Key: []byte("hello"), Val: []byte("value 2")})
 	c.Assert(err, check.IsNil)
 
-	err = l.Put([]byte("hello2"), []byte("value 3"))
+	err = l.Put(Item{Key: []byte("hello2"), Val: []byte("value 3")})
 	c.Assert(err, check.IsNil)
 
 	_, err = l.file.Seek(400, 0)
@@ -454,13 +454,13 @@ func (s *DirSuite) TestRepairShortWrite(c *check.C) {
 	c.Assert(err, check.IsNil)
 	defer l.Close()
 
-	err = l.Create([]byte("hello"), []byte("world"))
+	err = l.Create(Item{Key: []byte("hello"), Val: []byte("world")})
 	c.Assert(err, check.IsNil)
 
-	err = l.Update([]byte("hello"), []byte("value 2"))
+	err = l.Update(Item{Key: []byte("hello"), Val: []byte("value 2")})
 	c.Assert(err, check.IsNil)
 
-	err = l.Put([]byte("hello2"), []byte("value 3"))
+	err = l.Put(Item{Key: []byte("hello2"), Val: []byte("value 3")})
 	c.Assert(err, check.IsNil)
 
 	fi, err := l.file.Stat()
@@ -562,13 +562,13 @@ func (s *DirSuite) repairLargeRecord(c *check.C, tc repairCase) {
 	val := makeVal(tc.valSize)
 
 	// first, put a small record
-	err = l.Put([]byte("a"), []byte("a val"))
+	err = l.Put(Item{Key: []byte("a"), Val: []byte("a val")})
 	c.Assert(err, check.IsNil)
 
-	err = l.Create(key, val)
+	err = l.Create(Item{Key: key, Val: val})
 	c.Assert(err, check.IsNil)
 
-	err = l.Put([]byte("b"), []byte("b val"))
+	err = l.Put(Item{Key: []byte("b"), Val: []byte("b val")})
 	c.Assert(err, check.IsNil)
 
 	_, err = l.file.Seek(int64(tc.corruptAtOffset), 0)

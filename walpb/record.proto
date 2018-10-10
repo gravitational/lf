@@ -47,10 +47,13 @@ message Record {
     required bool LastPart = 4  [(gogoproto.nullable) = false];
     // Operation defines operation type
     required Operation Operation =  5 [(gogoproto.nullable) = false];
+    // Expires is an optional Unix seconds epoch expiration time
+    // for this record, if 0 means record does not expire
+    optional int64 Expires    =  6 [(gogoproto.nullable) = false];    
     // Key is the key in the key value tuple being created, updated or deleted
-	optional bytes  Key          =  6;
+	optional bytes  Key          =  7;
     // Val is set for all operations except DELETE, REOPEN
-	optional bytes  Val          =  7;
+	optional bytes  Val          =  8;
 }
 
 // State represents database state

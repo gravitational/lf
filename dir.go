@@ -18,6 +18,7 @@ import (
 	"github.com/gravitational/lf/walpb"
 
 	"github.com/gravitational/trace"
+	"github.com/jonboulle/clockwork"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -67,6 +68,8 @@ type DirLogConfig struct {
 	BTreeDegree int
 	// Repair launches repair operation on database open
 	Repair bool
+	// Clock is a clock for time-related operations
+	Clock clockwork.Clock
 }
 
 // CheckAndSetDefaults checks and sets default values
@@ -86,6 +89,9 @@ func (cfg *DirLogConfig) CheckAndSetDefaults() error {
 	if cfg.BTreeDegree <= 0 {
 		cfg.BTreeDegree = defaultBTreeDegree
 	}
+	if cfg.Clock == nil {
+		cfg.Clock = clockwork.NewRealClock()
+	}
 	return nil
 }
 
@@ -103,6 +109,7 @@ func NewDirLog(cfg DirLogConfig) (*DirLog, error) {
 		}),
 		DirLogConfig: cfg,
 		tree:         btree.New(cfg.BTreeDegree),
+		heap:         NewMinHeap(),
 		marshaler:    NewContainerMarshaler(),
 	}
 	d.pool = &sync.Pool{
@@ -143,6 +150,8 @@ type DirLog struct {
 	pool *sync.Pool
 	// tree is a BTree with items
 	tree *btree.BTree
+	// heap is a min heap with expiry records
+	heap *MinHeap
 	// recordID is a current record id,
 	// incremented on every record read
 	recordID uint64
@@ -274,6 +283,8 @@ func (d *DirLog) tryCompact(ctx context.Context, repair bool) error {
 	if err != nil {
 		return trace.Wrap(err)
 	}
+
+	d.removeExpired()
 
 	// 3. write the compacted version of the data to the non-current file
 	var compactedFile *os.File
@@ -457,12 +468,44 @@ func (d *DirLog) newReader(f *os.File, repair bool) reader {
 	}
 }
 
+// removeExpired makes a pass through map and removes expired elements
+// returns the number of expired elements removed
+func (d *DirLog) removeExpired() int {
+	removed := 0
+	now := d.Clock.Now().UTC()
+	for {
+		if d.tree.Len() == 0 {
+			break
+		}
+		item := d.heap.PeekEl()
+		if now.After(item.Expires) {
+			break
+		}
+		d.heap.PopEl()
+		d.tree.Delete(item)
+		removed++
+	}
+	return removed
+}
+
 func (d *DirLog) processRecord(record *walpb.Record) {
 	switch record.Operation {
 	case walpb.Operation_CREATE, walpb.Operation_UPDATE, walpb.Operation_PUT:
-		d.tree.ReplaceOrInsert(&Item{Key: record.Key, Val: record.Val, ID: record.ID})
+		item := &Item{Key: record.Key, Val: record.Val, ID: record.ID}
+		if record.Expires != 0 {
+			item.Expires = time.Unix(record.Expires, 0)
+		}
+		if item.Expires.IsZero() || d.Clock.Now().Before(item.Expires) {
+			d.heap.PushEl(item)
+			d.tree.ReplaceOrInsert(item)
+		}
 	case walpb.Operation_DELETE:
-		d.tree.Delete(&Item{Key: record.Key})
+		treeItem := d.tree.Get(&Item{Key: record.Key})
+		if treeItem != nil {
+			item := treeItem.(*Item)
+			d.tree.Delete(item)
+			d.heap.RemoveEl(item)
+		}
 	default:
 		// skip unsupported record
 	}
@@ -471,6 +514,7 @@ func (d *DirLog) processRecord(record *walpb.Record) {
 // checkOperation checks wether operation will succeed without
 // applying it to the tree
 func (d *DirLog) checkOperation(record *Record) error {
+	d.removeExpired()
 	switch record.Type {
 	case OpCreate:
 		if d.tree.Get(&Item{Key: record.Key}) != nil {
@@ -540,27 +584,43 @@ func (d *DirLog) readAll(p readParams) error {
 	return nil
 }
 
-func (d *DirLog) Put(key []byte, val []byte) error {
+type CreateOption struct {
+	Expires time.Time
+}
+
+type CreateOptionArg func(o *CreateOption) error
+
+func WithExpiry(expires time.Time) CreateOptionArg {
+	return func(o *CreateOption) error {
+		o.Expires = expires
+		return nil
+	}
+}
+
+func (d *DirLog) Put(i Item) error {
 	return d.Append(Record{
-		Type: OpPut,
-		Key:  key,
-		Val:  val,
+		Type:    OpPut,
+		Key:     i.Key,
+		Val:     i.Val,
+		Expires: i.Expires,
 	})
 }
 
-func (d *DirLog) Update(key []byte, val []byte) error {
+func (d *DirLog) Update(i Item) error {
 	return d.Append(Record{
-		Type: OpUpdate,
-		Key:  key,
-		Val:  val,
+		Type:    OpUpdate,
+		Key:     i.Key,
+		Val:     i.Val,
+		Expires: i.Expires,
 	})
 }
 
-func (d *DirLog) Create(key []byte, val []byte) error {
+func (d *DirLog) Create(i Item) error {
 	return d.Append(Record{
-		Type: OpCreate,
-		Key:  key,
-		Val:  val,
+		Type:    OpCreate,
+		Key:     i.Key,
+		Val:     i.Val,
+		Expires: i.Expires,
 	})
 }
 
@@ -762,6 +822,9 @@ func (d *DirLog) split(src Record, pid uint64, recordID uint64) (*walpb.Record, 
 		Key:       src.Key,
 		Val:       src.Val,
 		LastPart:  true,
+	}
+	if !src.Expires.IsZero() {
+		fullRecord.Expires = src.Expires.UTC().Unix()
 	}
 
 	r := fullRecord

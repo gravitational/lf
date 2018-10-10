@@ -3,6 +3,7 @@ package lf
 import (
 	"bytes"
 	"context"
+	"time"
 
 	"github.com/gravitational/lf/walpb"
 
@@ -60,9 +61,13 @@ type Item struct {
 	Key []byte
 	// Val is a value of the key value item
 	Val []byte
+	// Expires is an optional record expiry time
+	Expires time.Time
 	// ID is a record ID
 	// that is auto incremented with every operation
 	ID uint64
+	// index is a position in internal min-heap
+	index int
 }
 
 // Less is used for Btree operations,
@@ -90,6 +95,9 @@ type Record struct {
 	ProcessID uint64
 	// ID is internal record id
 	ID uint64
+	// Expires is an optional record expiry time
+	// if zero, ignored
+	Expires time.Time
 }
 
 // CheckAndSetDefaults checks record values
