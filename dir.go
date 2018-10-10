@@ -478,7 +478,7 @@ func (d *DirLog) removeExpired() int {
 			break
 		}
 		item := d.heap.PeekEl()
-		if now.After(item.Expires) {
+		if now.Before(item.Expires) {
 			break
 		}
 		d.heap.PopEl()
@@ -661,6 +661,7 @@ func (d *DirLog) GetRange(key []byte, r Range) (*GetResult, error) {
 	}
 	d.Lock()
 	defer d.Unlock()
+	d.removeExpired()
 	result, err := d.tryGet(key, r)
 	if err != nil {
 		if !IsReopenDatabaseError(err) {
