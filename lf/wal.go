@@ -5,7 +5,7 @@ import (
 	"context"
 	"time"
 
-	"github.com/gravitational/lf/walpb"
+	"github.com/gravitational/lf/lf/walpb"
 
 	"github.com/google/btree"
 	"github.com/gravitational/trace"

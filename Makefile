@@ -23,7 +23,7 @@ gen: buildbox
 buildbox-gen:
 # standard GRPC output
 	echo $$PROTO_INCLUDE
-	cd walpb && protoc --gogofast_out=. -I=.:$$PROTO_INCLUDE *.proto
+	cd lf/walpb && protoc --gogofast_out=. -I=.:$$PROTO_INCLUDE *.proto
 
 # sloccount returns a count of lines in go sources
 .PHONY: sloccount
@@ -37,6 +37,6 @@ bench:
 
 .PHONY: cover
 cover:
-	go test . -coverprofile=cover.out
+	go test ./lf -coverprofile=cover.out
 	go tool cover -html=cover.out
 

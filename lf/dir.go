@@ -14,8 +14,8 @@ import (
 	"time"
 
 	"github.com/google/btree"
-	"github.com/gravitational/lf/fs"
-	"github.com/gravitational/lf/walpb"
+	"github.com/gravitational/lf/lf/fs"
+	"github.com/gravitational/lf/lf/walpb"
 
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"

@@ -8,8 +8,8 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/gravitational/lf/fs"
-	"github.com/gravitational/lf/walpb"
+	"github.com/gravitational/lf/lf/fs"
+	"github.com/gravitational/lf/lf/walpb"
 
 	"github.com/gravitational/trace"
 	log "github.com/sirupsen/logrus"
