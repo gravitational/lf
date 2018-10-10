@@ -474,7 +474,7 @@ func (d *DirLog) removeExpired() int {
 	removed := 0
 	now := d.Clock.Now().UTC()
 	for {
-		if d.tree.Len() == 0 {
+		if len(*d.heap) == 0 {
 			break
 		}
 		item := d.heap.PeekEl()
@@ -491,12 +491,14 @@ func (d *DirLog) removeExpired() int {
 func (d *DirLog) processRecord(record *walpb.Record) {
 	switch record.Operation {
 	case walpb.Operation_CREATE, walpb.Operation_UPDATE, walpb.Operation_PUT:
-		item := &Item{Key: record.Key, Val: record.Val, ID: record.ID}
+		item := &Item{Key: record.Key, Val: record.Val, ID: record.ID, index: -1}
 		if record.Expires != 0 {
 			item.Expires = time.Unix(record.Expires, 0)
 		}
 		if item.Expires.IsZero() || d.Clock.Now().Before(item.Expires) {
-			d.heap.PushEl(item)
+			if !item.Expires.IsZero() {
+				d.heap.PushEl(item)
+			}
 			d.tree.ReplaceOrInsert(item)
 		}
 	case walpb.Operation_DELETE:
@@ -504,7 +506,9 @@ func (d *DirLog) processRecord(record *walpb.Record) {
 		if treeItem != nil {
 			item := treeItem.(*Item)
 			d.tree.Delete(item)
-			d.heap.RemoveEl(item)
+			if item.index >= 0 {
+				d.heap.RemoveEl(item)
+			}
 		}
 	default:
 		// skip unsupported record
