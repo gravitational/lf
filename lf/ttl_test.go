@@ -196,3 +196,57 @@ func (s *DirSuite) TestTTLOverride(c *check.C) {
 	c.Assert(err, check.IsNil)
 	c.Assert(string(out.Val), check.Equals, "b val 2")
 }
+
+// TestTTLCompareAndSwap tests compare and swap functionality
+func (s *DirSuite) TestTTLCompareAndSwap(c *check.C) {
+	clock := clockwork.NewFakeClock()
+	dir := c.MkDir()
+	l, err := NewDirLog(DirLogConfig{
+		Dir:                 dir,
+		CompactionsDisabled: true,
+		Clock:               clock,
+	})
+	c.Assert(err, check.IsNil)
+	defer l.Close()
+
+	now := clock.Now().UTC()
+
+	err = l.Create(Item{Key: []byte("one"), Val: []byte("1"), Expires: now.Add(time.Second)})
+	c.Assert(err, check.IsNil)
+
+	clock.Advance(2 * time.Second)
+
+	// compare and swap on non existing value will fail
+	err = l.CompareAndSwap(Item{Key: []byte("one"), Val: []byte("1")}, Item{Key: []byte("one"), Val: []byte("2")})
+	c.Assert(trace.IsCompareFailed(err), check.Equals, true)
+
+	now = clock.Now().UTC()
+	err = l.Create(Item{Key: []byte("one"), Val: []byte("1"), Expires: now.Add(time.Second)})
+	c.Assert(err, check.IsNil)
+
+	l2, err := NewDirLog(DirLogConfig{
+		Dir:                 dir,
+		CompactionsDisabled: true,
+		Clock:               clock,
+	})
+	c.Assert(err, check.IsNil)
+	defer l2.Close()
+
+	// success CAS!
+	err = l2.CompareAndSwap(Item{Key: []byte("one"), Val: []byte("1")}, Item{Key: []byte("one"), Val: []byte("2"), Expires: now.Add(2 * time.Second)})
+	c.Assert(err, check.IsNil)
+
+	out, err := l.Get([]byte("one"))
+	c.Assert(err, check.IsNil)
+	c.Assert(string(out.Val), check.Equals, "2")
+
+	clock.Advance(3 * time.Second)
+
+	// value has expired, compare and swap will fail
+	err = l2.CompareAndSwap(Item{Key: []byte("one"), Val: []byte("2")}, Item{Key: []byte("one"), Val: []byte("3")})
+	c.Assert(trace.IsCompareFailed(err), check.Equals, true)
+
+	// value has expired, not found
+	_, err = l.Get([]byte("one"))
+	c.Assert(trace.IsNotFound(err), check.Equals, true)
+}

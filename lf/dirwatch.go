@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/gravitational/lf/lf/fs"
@@ -109,6 +110,7 @@ func (d *DirWatcherConfig) CheckAndSetDefaults() error {
 
 // DirWatcher is directory log event watcher
 type DirWatcher struct {
+	sync.Mutex
 	DirWatcherConfig
 	*log.Entry
 	eventsC chan Record
@@ -120,6 +122,8 @@ type DirWatcher struct {
 
 // Close closes watcher and associated files
 func (d *DirWatcher) Close() error {
+	d.Lock()
+	defer d.Unlock()
 	d.cancel()
 	if err := d.logFile.Close(); err != nil {
 		return trace.Wrap(err)
@@ -197,6 +201,8 @@ func (d *DirWatcher) readLimit(batchSize int) ([]Record, error) {
 }
 
 func (d *DirWatcher) lockAndReadLimit() ([]Record, error) {
+	d.Lock()
+	defer d.Unlock()
 	if err := fs.ReadLock(d.logFile); err != nil {
 		return nil, trace.Wrap(err)
 	}

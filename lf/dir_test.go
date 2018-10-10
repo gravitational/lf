@@ -614,3 +614,121 @@ func (s *DirSuite) repairLargeRecord(c *check.C, tc repairCase) {
 	_, err = l.Get(key)
 	c.Assert(trace.IsNotFound(err), check.Equals, true)
 }
+
+// CompareAndSwap tests compare and swap functionality
+func (s *DirSuite) TestCompareAndSwap(c *check.C) {
+	dir := c.MkDir()
+	l, err := NewDirLog(DirLogConfig{
+		Dir:                 dir,
+		CompactionsDisabled: true,
+	})
+	c.Assert(err, check.IsNil)
+	defer l.Close()
+
+	// compare and swap on non existing value will fail
+	err = l.CompareAndSwap(Item{Key: []byte("one"), Val: []byte("1")}, Item{Key: []byte("one"), Val: []byte("2")})
+	c.Assert(trace.IsCompareFailed(err), check.Equals, true)
+
+	err = l.Create(Item{Key: []byte("one"), Val: []byte("1")})
+	c.Assert(err, check.IsNil)
+
+	l2, err := NewDirLog(DirLogConfig{
+		Dir:                 dir,
+		CompactionsDisabled: true,
+	})
+	c.Assert(err, check.IsNil)
+	defer l2.Close()
+
+	// success CAS!
+	err = l2.CompareAndSwap(Item{Key: []byte("one"), Val: []byte("1")}, Item{Key: []byte("one"), Val: []byte("2")})
+	c.Assert(err, check.IsNil)
+
+	out, err := l.Get([]byte("one"))
+	c.Assert(err, check.IsNil)
+	c.Assert(string(out.Val), check.Equals, "2")
+
+	// value has been updated - not '1' any more
+	err = l.CompareAndSwap(Item{Key: []byte("one"), Val: []byte("1")}, Item{Key: []byte("one"), Val: []byte("3")})
+	c.Assert(trace.IsCompareFailed(err), check.Equals, true)
+
+	// existing value has not been changed by the failed CAS operation
+	out, err = l.Get([]byte("one"))
+	c.Assert(err, check.IsNil)
+	c.Assert(string(out.Val), check.Equals, "2")
+}
+
+func (s *DirSuite) TestConcurrentOperations(c *check.C) {
+	dir := c.MkDir()
+	l, err := NewDirLog(DirLogConfig{
+		Dir:                 dir,
+		CompactionsDisabled: true,
+	})
+	c.Assert(err, check.IsNil)
+	defer l.Close()
+
+	l2, err := NewDirLog(DirLogConfig{
+		Dir:                 dir,
+		CompactionsDisabled: true,
+	})
+	c.Assert(err, check.IsNil)
+	defer l2.Close()
+
+	value1 := "this first value should not be corrupted by concurrent ops"
+	value2 := "this second value should not be corrupted too"
+	const attempts = 50
+	resultsC := make(chan struct{}, attempts*4)
+	for i := 0; i < attempts; i++ {
+		go func(cnt int) {
+			err := l.Put(Item{Key: []byte("key"), Val: []byte(value1)})
+			resultsC <- struct{}{}
+			c.Assert(err, check.IsNil)
+		}(i)
+
+		go func(cnt int) {
+			err := l2.CompareAndSwap(Item{Key: []byte("key"), Val: []byte(value2)}, Item{Key: []byte("key"), Val: []byte(value1)})
+			resultsC <- struct{}{}
+			if err != nil && !trace.IsCompareFailed(err) {
+				c.Assert(err, check.IsNil)
+			}
+		}(i)
+
+		go func(cnt int) {
+			err := l2.Create(Item{Key: []byte("key"), Val: []byte(value2)})
+			resultsC <- struct{}{}
+			if err != nil && !trace.IsAlreadyExists(err) {
+				c.Assert(err, check.IsNil)
+			}
+		}(i)
+
+		go func(cnt int) {
+			item, err := l.Get([]byte("key"))
+			resultsC <- struct{}{}
+			if err != nil && !trace.IsNotFound(err) {
+				c.Assert(err, check.IsNil)
+			}
+			// make sure data is not corrupted along the way
+			if err == nil {
+				val := string(item.Val)
+				if val != value1 && val != value2 {
+					c.Fatalf("expected one of %q or %q and got %q", value1, value2, val)
+				}
+			}
+		}(i)
+
+		go func(cnt int) {
+			err := l2.Delete([]byte("key"))
+			if err != nil && !trace.IsNotFound(err) {
+				c.Assert(err, check.IsNil)
+			}
+			resultsC <- struct{}{}
+		}(i)
+	}
+	timeoutC := time.After(3 * time.Second)
+	for i := 0; i < attempts*5; i++ {
+		select {
+		case <-resultsC:
+		case <-timeoutC:
+			c.Fatalf("timeout waiting for goroutines to finish")
+		}
+	}
+}

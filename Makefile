@@ -35,8 +35,15 @@ sloccount:
 bench:
 	go test ./lf -v -check.f=Benchmark -check.b -check.bmem
 
+# cover runs tests with coverage on
 .PHONY: cover
 cover:
 	go test ./lf -coverprofile=cover.out
 	go tool cover -html=cover.out
+
+# test runs tests with race detector and vetting
+.PHONY: test
+test:
+	go test -race ./lf/...
+
 

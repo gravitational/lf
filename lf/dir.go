@@ -642,6 +642,67 @@ func (d *DirLog) Update(i Item) error {
 	})
 }
 
+func (d *DirLog) CompareAndSwap(expected Item, replaceWith Item) error {
+	if len(expected.Key) == 0 {
+		return trace.BadParameter("missing parameter Key")
+	}
+	if len(replaceWith.Key) == 0 {
+		return trace.BadParameter("missing parameter Key")
+	}
+	if bytes.Compare(expected.Key, replaceWith.Key) != 0 {
+		return trace.BadParameter("expected and replaceWith keys should match")
+	}
+	r := Record{
+		Type:    OpUpdate,
+		Key:     replaceWith.Key,
+		Val:     replaceWith.Val,
+		Expires: replaceWith.Expires,
+	}
+	d.Lock()
+	defer d.Unlock()
+
+	// grab a lock, read and seek to the end of file and sync up the state
+	// note that this is a write lock,
+	// because compare can result in update operation, make
+	// sure no new writes are being done after read has occurred
+	if err := fs.WriteLock(d.file); err != nil {
+		return trace.Wrap(err)
+	}
+	defer fs.Unlock(d.file)
+
+	d.removeExpired()
+
+	result, err := d.tryGetNoLock(expected.Key, Range{})
+
+	if err != nil {
+		if !IsReopenDatabaseError(err) {
+			return trace.Wrap(err)
+		}
+		if err := d.closeWithoutLock(); err != nil {
+			return trace.Wrap(err)
+		}
+		if err := d.open(); err != nil {
+			return trace.Wrap(err)
+		}
+		if result, err = d.tryGetNoLock(expected.Key, Range{}); err != nil {
+			return trace.Wrap(err)
+		}
+	}
+
+	if len(result.Items) == 0 {
+		return trace.CompareFailed("item is not found")
+	} else if len(result.Items) > 1 {
+		return trace.CompareFailed("expected single item, got %v", len(result.Items))
+	}
+
+	found := result.Items[0]
+	if bytes.Compare(found.Val, expected.Val) != 0 {
+		return trace.CompareFailed("item values do not match")
+	}
+
+	return d.tryAppend(r)
+}
+
 func (d *DirLog) Create(i Item) error {
 	return d.Append(Record{
 		Type:    OpCreate,
@@ -722,6 +783,11 @@ func (d *DirLog) tryGet(key []byte, r Range) (*GetResult, error) {
 		return nil, trace.Wrap(err)
 	}
 	defer fs.Unlock(d.file)
+
+	return d.tryGetNoLock(key, r)
+}
+
+func (d *DirLog) tryGetNoLock(key []byte, r Range) (*GetResult, error) {
 	if err := d.readAll(readParams{file: d.file, limit: -1, recordID: &d.recordID, processRecord: d.processRecord, repair: false}); err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -768,7 +834,6 @@ func (d *DirLog) Append(r Record) error {
 	}
 	d.Lock()
 	defer d.Unlock()
-
 	err := d.tryAppend(r)
 	if err != nil {
 		if !IsReopenDatabaseError(err) {
@@ -794,6 +859,10 @@ func (d *DirLog) tryAppend(r Record) error {
 		return trace.Wrap(err)
 	}
 	defer fs.Unlock(d.file)
+	return d.tryAppendNoLock(r)
+}
+
+func (d *DirLog) tryAppendNoLock(r Record) error {
 	if err := d.readAll(readParams{file: d.file, limit: -1, recordID: &d.recordID, processRecord: d.processRecord, repair: false}); err != nil {
 		return trace.Wrap(err)
 	}
