@@ -2,6 +2,7 @@ PROTOC_VER ?= 3.6.1
 GOGO_PROTO_TAG ?= v1.1.1
 PLATFORM := linux-x86_64
 BUILDBOX_TAG := gravitationallf
+BUILDDIR ?= build
 
 # buildbox builds docker buildbox image used to compile binaries and generate GRPc stuff
 .PHONY: buildbox
@@ -45,5 +46,10 @@ cover:
 .PHONY: test
 test:
 	go test -race ./lf/...
+
+.PHONY: lf
+lf:
+	mkdir -p $(BUILDDIR)
+	go build -o $(BUILDDIR)/lf github.com/gravitational/lf/tool/lf
 
 

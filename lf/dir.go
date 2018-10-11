@@ -500,6 +500,7 @@ func (d *DirLog) processRecord(record *walpb.Record) {
 		if treeItem != nil {
 			existingItem = treeItem.(*Item)
 		}
+		//		d.Debugf("Process record %v %v %v", string(item.Key), string(item.Val), item.Expires)
 		switch {
 		case item.Expires.IsZero():
 			// new item is added, it does not expire,
@@ -509,18 +510,30 @@ func (d *DirLog) processRecord(record *walpb.Record) {
 				d.heap.RemoveEl(existingItem)
 			}
 			d.tree.ReplaceOrInsert(item)
-		case d.Clock.Now().Before(item.Expires):
+		case !item.Expires.IsZero() && d.Clock.Now().Before(item.Expires):
 			// new item is added, but it has not expired yet
 			if existingItem != nil {
 				// existing item should be updated on the heap
 				if existingItem.index >= 0 {
 					d.heap.UpdateEl(existingItem, item.Expires)
+				} else {
+					d.heap.PushEl(item)
 				}
 			} else {
 				// new item should be added on the heap
 				d.heap.PushEl(item)
 			}
 			d.tree.ReplaceOrInsert(item)
+		case !item.Expires.IsZero() && (d.Clock.Now().After(item.Expires) || d.Clock.Now() == item.Expires):
+			// new expired item has added, remove the existing
+			// item if present
+			if existingItem != nil {
+				// existing item should be removed from the heap
+				if existingItem.index >= 0 {
+					d.heap.RemoveEl(existingItem)
+				}
+				d.tree.Delete(existingItem)
+			}
 		default:
 			// skip adding or updating the item that has expired
 		}

@@ -1,2 +1,6 @@
 *.test
 cover.out
+build
+first
+second
+state

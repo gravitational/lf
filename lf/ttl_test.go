@@ -197,6 +197,48 @@ func (s *DirSuite) TestTTLOverride(c *check.C) {
 	c.Assert(string(out.Val), check.Equals, "b val 2")
 }
 
+// TestTTLStartExpiry tests scenarios when non-expired
+// record is overwriteen by the version that is expired
+func (s *DirSuite) TestTTLStartExpiry(c *check.C) {
+	dir := c.MkDir()
+	clock := clockwork.NewFakeClock()
+	l, err := NewDirLog(DirLogConfig{
+		Dir:                 dir,
+		PollPeriod:          10 * time.Millisecond,
+		CompactionsDisabled: true,
+		Clock:               clock,
+	})
+	c.Assert(err, check.IsNil)
+	defer l.Close()
+
+	// first version of the record is not expired
+	now := clock.Now().UTC()
+	err = l.Put(Item{Key: []byte("a"), Val: []byte("a val")})
+	c.Assert(err, check.IsNil)
+
+	// Update with value that does expire in a second
+	err = l.Put(Item{Key: []byte("a"), Val: []byte("a val 2"), Expires: now.Add(time.Second)})
+	c.Assert(err, check.IsNil)
+
+	clock.Advance(2 * time.Second)
+
+	// both backends see object as not found
+	out, err := l.Get([]byte("a"))
+	c.Assert(trace.IsNotFound(err), check.Equals, true, check.Commentf("%v %v", out, err))
+
+	l2, err := NewDirLog(DirLogConfig{
+		Dir:                 dir,
+		CompactionsDisabled: true,
+		Clock:               clock,
+	})
+	c.Assert(err, check.IsNil)
+	defer l2.Close()
+
+	// both backends see object as not found
+	out, err = l2.Get([]byte("a"))
+	c.Assert(trace.IsNotFound(err), check.Equals, true, check.Commentf("%v %v", out, err))
+}
+
 // TestTTLCompareAndSwap tests compare and swap functionality
 func (s *DirSuite) TestTTLCompareAndSwap(c *check.C) {
 	clock := clockwork.NewFakeClock()
