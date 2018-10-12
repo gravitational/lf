@@ -30,6 +30,23 @@ func (o OpType) Operation() (walpb.Operation, error) {
 	}
 }
 
+func (o OpType) String() string {
+	switch o {
+	case OpCreate:
+		return "Create"
+	case OpUpdate:
+		return "Update"
+	case OpPut:
+		return "Put"
+	case OpDelete:
+		return "Delete"
+	case OpReopen:
+		return "Reopen"
+	default:
+		return "unknown"
+	}
+}
+
 func FromRecordOperation(op walpb.Operation) (OpType, error) {
 	switch op {
 	case walpb.Operation_CREATE:

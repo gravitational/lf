@@ -102,6 +102,8 @@ func NewDirLog(cfg DirLogConfig) (*DirLog, error) {
 		return nil, trace.Wrap(err)
 	}
 
+	ctx, cancel := context.WithCancel(cfg.Context)
+
 	d := &DirLog{
 		Mutex: &sync.Mutex{},
 		Entry: log.WithFields(log.Fields{
@@ -111,6 +113,8 @@ func NewDirLog(cfg DirLogConfig) (*DirLog, error) {
 		tree:         btree.New(cfg.BTreeDegree),
 		heap:         NewMinHeap(),
 		marshaler:    NewContainerMarshaler(),
+		cancel:       cancel,
+		ctx:          ctx,
 	}
 	d.pool = &sync.Pool{
 		New: func() interface{} {
@@ -159,6 +163,11 @@ type DirLog struct {
 	state walpb.State
 	// marshaler is a container marshaler
 	marshaler *ContainerMarshaler
+	// cancel is a function that cancels
+	// all operations
+	cancel context.CancelFunc
+	// ctx is a context signalling close
+	ctx context.Context
 }
 
 // NewWatcher returns new watcher matching prefix,
@@ -186,7 +195,7 @@ compactloop:
 	for {
 		select {
 		case <-retryChannel:
-			err := d.tryCompactAndReopen(d.Context)
+			err := d.tryCompactAndReopen(d.ctx)
 			if err == nil {
 				retryChannel = nil
 				continue compactloop
@@ -194,15 +203,53 @@ compactloop:
 			d.Debugf("Compact and reopen failed: %v, will retry %v.", err)
 		case <-compactionTicker.C:
 			for {
-				err := d.tryCompactAndReopen(d.Context)
+				err := d.tryCompactAndReopen(d.ctx)
 				if err == nil {
 					continue compactloop
 				}
 				d.Debugf("Compact and reopen failed: %v, will retry: %v.", err)
 				retryChannel = retryTicker.C
 			}
-		case <-d.Context.Done():
+		case <-d.ctx.Done():
 			d.Debugf("DirLog is closing, returning.")
+		}
+	}
+}
+
+// Compact blocks and locks the database until
+// it compacts it or gets cancelled via context
+func (d *DirLog) Compact(ctx context.Context) error {
+	start := d.Clock.Now().UTC()
+	err := d.tryCompactAndReopen(ctx)
+	if err == nil {
+		d.Debugf("Compaction completed in %v.", d.Clock.Now().UTC().Sub(start))
+		return nil
+	}
+	if !trace.IsCompareFailed(err) {
+		return trace.Wrap(err)
+	}
+	d.Debugf("Compaction could not lock the database: %v, will try again.", err)
+	compactionTicker := time.NewTicker(d.PollPeriod)
+	defer compactionTicker.Stop()
+	for {
+		select {
+		case <-compactionTicker.C:
+			start := d.Clock.Now().UTC()
+			if err := d.tryCompactAndReopen(ctx); err != nil {
+				if trace.IsCompareFailed(err) {
+					d.Debugf("Compaction could not lock the database: %v, will try again.", err)
+					continue
+				}
+				return trace.Wrap(err)
+			}
+			d.Debugf("Compaction completed in %v.", d.Clock.Now().UTC().Sub(start))
+			return nil
+		case <-ctx.Done():
+			d.Debugf("Context is closing, returning.")
+			return trace.ConnectionProblem(ctx.Err(), "context is closed")
+		case <-d.ctx.Done():
+			d.Debugf("Context is closing, returning.")
+			return trace.ConnectionProblem(ctx.Err(), "context is closed")
 		}
 	}
 }
@@ -429,6 +476,7 @@ func (d *DirLog) open() error {
 }
 
 func (d *DirLog) Close() error {
+	d.cancel()
 	d.Lock()
 	defer d.Unlock()
 	return d.closeWithoutLock()
@@ -835,10 +883,10 @@ type prefixItem struct {
 // Less is used for Btree operations
 func (p *prefixItem) Less(iother btree.Item) bool {
 	other := iother.(*Item)
-	if bytes.HasPrefix(p.prefix, other.Key) {
-		return true
+	if bytes.HasPrefix(other.Key, p.prefix) {
+		return false
 	}
-	return false
+	return true
 }
 
 func (d *DirLog) Append(r Record) error {

@@ -146,6 +146,11 @@ func (s *DirSuite) TestRanges(c *check.C) {
 	err = l.Create(Item{Key: []byte("/prefix/c/c2"), Val: []byte("val c2")})
 	c.Assert(err, check.IsNil)
 
+	// add element that does not match the range to make
+	// sure it won't get included in the list
+	err = l.Create(Item{Key: []byte("a"), Val: []byte("no match a")})
+	c.Assert(err, check.IsNil)
+
 	// prefix range fetch
 	result, err := l.GetRange([]byte("/prefix"), Range{MatchPrefix: true})
 	c.Assert(err, check.IsNil)
