@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"text/tabwriter"
 	"time"
 
 	"github.com/gravitational/lf/lf"
@@ -50,12 +51,19 @@ func run() error {
 		clsWithIDs  = cls.Flag("ids", "Show record ids").Default("false").Bool()
 		clsWithVals = cls.Flag("vals", "Show values").Default("false").Bool()
 
-		cwatch         = app.Command("watch", "Watch prefix")
-		cwatchPrefix   = cwatch.Arg("prefix", "Prefix to watch").String()
-		cwatchRecordID = cwatch.Flag("id", "Record it to start watch at").Int64()
+		cwatch           = app.Command("watch", "Watch prefix")
+		cwatchPrefix     = cwatch.Arg("prefix", "Prefix to watch").String()
+		cwatchEventsOnly = cwatch.Flag("events-only", "Do not output keys and values, just events").Bool()
+		cwatchRecordID   = cwatch.Flag("id", "Record it to start watch at").Int64()
 
 		ccompact = app.Command("compact", "Compact database")
 		crepair  = app.Command("repair", "Repair database")
+
+		cbench         = app.Command("bench", "Run benchmark against database")
+		cbenchConfirm  = cbench.Flag("confirm", "Confirm").Default("false").Bool()
+		cbenchDuration = cbench.Flag("duration", "Benchmark duration").Default("10s").Duration()
+		cbenchThreads  = cbench.Flag("threads", "Concurrent threads to run").Default("10").Int()
+		cbenchRate     = cbench.Flag("rate", "Requests per second rate").Default("10").Int()
 	)
 
 	cmd, err := app.Parse(os.Args[1:])
@@ -82,11 +90,13 @@ func run() error {
 	case cls.FullCommand():
 		return ls(*dir, *clsPrefix, *clsWithIDs, *clsWithVals)
 	case cwatch.FullCommand():
-		return watch(setupSignalHandlers(), *dir, *cwatchPrefix, *cwatchRecordID)
+		return watch(setupSignalHandlers(), *dir, *cwatchPrefix, *cwatchRecordID, *cwatchEventsOnly)
 	case ccompact.FullCommand():
 		return compact(setupSignalHandlers(), *dir)
 	case crepair.FullCommand():
 		return repair(setupSignalHandlers(), *dir)
+	case cbench.FullCommand():
+		return bench(setupSignalHandlers(), *dir, *cbenchDuration, *cbenchThreads, *cbenchRate, *cbenchConfirm)
 	case cset.FullCommand():
 		var expires time.Time
 		if *csetTTL > 0 {
@@ -173,7 +183,7 @@ func ls(dir string, prefix string, showIDs, showVals bool) error {
 	return nil
 }
 
-func watch(ctx context.Context, dir string, prefix string, recordID int64) error {
+func watch(ctx context.Context, dir string, prefix string, recordID int64, onlyEvents bool) error {
 	l, err := lf.NewDirLog(lf.DirLogConfig{
 		Dir:     dir,
 		Context: ctx,
@@ -190,23 +200,33 @@ func watch(ctx context.Context, dir string, prefix string, recordID int64) error
 			RecordID:      uint64(recordID),
 		}
 	}
-	watcher, err := l.NewWatcher([]byte(prefix), offset)
-	if err != nil {
-		return trace.Wrap(err)
-	}
-	defer watcher.Close()
-
-	for {
-		select {
-		case event := <-watcher.Events():
-			fmt.Fprintln(os.Stdout, eventToString(event))
-		case <-watcher.Done():
-			fmt.Println("Watcher has exited.")
-			return nil
-		case <-ctx.Done():
-			fmt.Println("Interrupted.")
-			return nil
+	var continueErr = trace.ConnectionProblem(nil, "continue")
+	watch := func() error {
+		watcher, err := l.NewWatcher([]byte(prefix), offset)
+		if err != nil {
+			return trace.Wrap(err)
 		}
+		defer watcher.Close()
+
+		for {
+			select {
+			case <-watcher.Done():
+				fmt.Println("Watcher has closed. Restarting.")
+				return continueErr
+			case event := <-watcher.Events():
+				fmt.Fprintln(os.Stdout, eventToString(event, onlyEvents))
+			case <-ctx.Done():
+				fmt.Println("Interrupted.")
+				return nil
+			}
+		}
+	}
+	for {
+		err := watch()
+		if err == continueErr {
+			continue
+		}
+		return err
 	}
 }
 
@@ -239,6 +259,48 @@ func repair(ctx context.Context, dir string) error {
 	return nil
 }
 
+func bench(ctx context.Context, dir string, duration time.Duration, threads, rate int, confirmed bool) error {
+	if !confirmed {
+		return trace.BadParameter("'lf bench' is a dangerous operation and can overwrite existing data in %v, use 'lf bench --confirm' to proceed", dir)
+	}
+
+	fmt.Fprintf(os.Stdout, "Starting benchmark.\n")
+	start := time.Now().UTC()
+
+	result, err := RunBenchmark(ctx, Benchmark{
+		Dir:      dir,
+		Threads:  threads,
+		Rate:     rate,
+		Duration: duration,
+	})
+	if err != nil {
+		return trace.Wrap(err)
+	}
+
+	fmt.Printf("\n")
+	fmt.Printf("* Completed in %v.\n", time.Now().UTC().Sub(start))
+	fmt.Printf("* Requests originated: %v\n", result.RequestsOriginated)
+	fmt.Printf("* Requests failed: %v\n", result.RequestsFailed)
+	if result.LastError != nil {
+		fmt.Printf("* Last error: %v\n", result.LastError)
+	}
+	fmt.Printf("\nHistogram\n\n")
+	var buffer bytes.Buffer
+	t := tabwriter.NewWriter(&buffer, 5, 0, 1, ' ', 0)
+	fmt.Fprintf(t, "Percentile\tDuration\t\n")
+	for _, quantile := range []float64{25, 50, 75, 90, 95, 99, 100} {
+		fmt.Fprintf(t, "%v\t%v\t\n",
+			fmt.Sprintf("%v", quantile),
+			fmt.Sprintf("%v ms", result.Histogram.ValueAtQuantile(quantile)),
+		)
+	}
+	t.Flush()
+	os.Stdout.Write(buffer.Bytes())
+	fmt.Printf("\n")
+
+	return nil
+}
+
 func itemToString(item lf.Item, showID, showVal bool) string {
 	out := &bytes.Buffer{}
 	if showID {
@@ -255,14 +317,16 @@ func itemToString(item lf.Item, showID, showVal bool) string {
 	return out.String()
 }
 
-func eventToString(event lf.Record) string {
+func eventToString(event lf.Record, onlyEvents bool) string {
 	out := &bytes.Buffer{}
 	fmt.Fprintf(out, "%v %v ", event.ID, event.Type)
-	if event.Key != nil {
-		fmt.Fprintf(out, "%v ", string(event.Key))
-	}
-	if event.Val != nil {
-		fmt.Fprintf(out, "%v ", string(event.Val))
+	if !onlyEvents {
+		if event.Key != nil {
+			fmt.Fprintf(out, "%v ", string(event.Key))
+		}
+		if event.Val != nil {
+			fmt.Fprintf(out, "%v ", string(event.Val))
+		}
 	}
 	return out.String()
 }

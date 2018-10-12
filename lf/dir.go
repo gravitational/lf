@@ -42,7 +42,7 @@ const (
 	// defaultPollPeriod is a default period between polling attempts
 	defaultPollPeriod = time.Second
 	// defaultCompactionPeriod is a default period between compactions
-	defaultCompactionPeriod = 30 * time.Minute
+	defaultCompactionPeriod = 60 * time.Second
 	// defaultBTreeDegreee is a default degree of a B-Tree
 	defaultBTreeDegree = 8
 )
@@ -200,7 +200,7 @@ compactloop:
 				retryChannel = nil
 				continue compactloop
 			}
-			d.Debugf("Compact and reopen failed: %v, will retry %v.", err)
+			d.Debugf("Compact and reopen failed: %v, will retry in %v.", err, time.Second)
 		case <-compactionTicker.C:
 			for {
 				err := d.tryCompactAndReopen(d.ctx)
