@@ -1,0 +1,71 @@
+syntax = "proto2";
+package walpb;
+
+import "gogoproto/gogo.proto";
+
+option (gogoproto.marshaler_all) = true;
+option (gogoproto.sizer_all) = true;
+option (gogoproto.unmarshaler_all) = true;
+option (gogoproto.goproto_getters_all) = false;
+
+// Operation identifies type of record
+enum Operation {
+    // CREATE creates key-value pair
+    CREATE = 0;
+    // UPDATE deletes key-value pair
+    UPDATE = 1;
+    // PUT creates or updates existing key-value pair
+    PUT    = 2;
+    // DELETE deletes key-value pair
+    DELETE = 3;
+    // REOPEN is a system record signalling
+    // readers/writers to re-open the database (after compaction)
+    REOPEN = 4;
+}
+
+// Record is a record stored in operation log file
+message Record {
+    // ProcessID identifies different processes writing
+    // to the log, processes have to increase monotonically
+    // and be different for different processes writing
+    // to the same file to preserve integrity
+	required uint64 ProcessID    =  1 [(gogoproto.nullable) = false];
+    // ID is a record ID that is monothonically incremented by each process
+    // Several records have the same id if they carry on the value split
+    // into multiple containers, ID is monothonically incremented by each process.
+	required uint64 ID           =  2 [(gogoproto.nullable) = false];
+    // PartID is used to identify a part index (starting from 0)
+    // in a multi-part record, subsequent parts have incremental
+    // ids (0, 1, 2, 3 ...)
+    // Together, (ProcessID, ID, PartID) form a unique
+    // position index 3-tuple in a log.
+    required int32 PartID    =  3 [(gogoproto.nullable) = false];
+    // LastPart is false when record is split into multiple parts
+    // and this is not the last part, true if this is a last record
+    // of the multi-part record. If PartID is 0 and LastPart is true
+    // it means that this is a single part record.
+    required bool LastPart = 4  [(gogoproto.nullable) = false];
+    // Operation defines operation type
+    required Operation Operation =  5 [(gogoproto.nullable) = false];
+    // Expires is an optional Unix seconds epoch expiration time
+    // for this record, if 0 means record does not expire
+    optional int64 Expires    =  6 [(gogoproto.nullable) = false];    
+    // Key is the key in the key value tuple being created, updated or deleted
+	optional bytes  Key          =  7;
+    // Val is set for all operations except DELETE, REOPEN
+	optional bytes  Val          =  8;
+}
+
+// State represents database state
+message State {
+    // SchemaVersion is a version of the database schema
+    required uint64 SchemaVersion = 1  [(gogoproto.nullable) = false];
+    // ProcessID identifies different processes writing
+    // to the log, processes have to increase monotonically
+    // and be different for different processes writing
+    // to the same file to preserve integrity    
+    required uint64 ProcessID = 2 [(gogoproto.nullable) = false];
+    // LogID points to the monotonically incremented
+    // log file identifier
+    required uint64 LogID = 3  [(gogoproto.nullable) = false];
+}
