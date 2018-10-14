@@ -65,6 +65,7 @@ message State {
     // and be different for different processes writing
     // to the same file to preserve integrity    
     required uint64 ProcessID = 2 [(gogoproto.nullable) = false];
-    // CurrentFile points to current file name
-    required string CurrentFile = 3  [(gogoproto.nullable) = false];
+    // LogID points to the monotonically incremented
+    // log file identifier
+    required uint64 LogID = 3  [(gogoproto.nullable) = false];
 }

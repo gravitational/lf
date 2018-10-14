@@ -325,7 +325,7 @@ func (s *DirSuite) TestCompaction(c *check.C) {
 	c.Assert(err, check.IsNil)
 	defer l.Close()
 
-	c.Assert(filepath.Base(l.file.Name()), check.Equals, firstLogFileName)
+	c.Assert(filepath.Base(l.file.Name()), check.Equals, "0.lf")
 	c.Assert(l.state.ProcessID, check.Equals, uint64(1))
 
 	l2, err := NewDirLog(DirLogConfig{
@@ -335,7 +335,7 @@ func (s *DirSuite) TestCompaction(c *check.C) {
 	c.Assert(err, check.IsNil)
 	defer l2.Close()
 
-	c.Assert(filepath.Base(l2.file.Name()), check.Equals, firstLogFileName)
+	c.Assert(filepath.Base(l2.file.Name()), check.Equals, "0.lf")
 	c.Assert(l2.state.ProcessID, check.Equals, uint64(2))
 
 	err = l.Put(Item{Key: []byte("hello"), Val: []byte("world")})
@@ -348,7 +348,7 @@ func (s *DirSuite) TestCompaction(c *check.C) {
 	err = l.tryCompactAndReopen(context.TODO())
 	c.Assert(err, check.IsNil)
 
-	c.Assert(filepath.Base(l.file.Name()), check.Equals, secondLogFileName)
+	c.Assert(filepath.Base(l.file.Name()), check.Equals, "1.lf")
 	c.Assert(l.state.ProcessID, check.Equals, uint64(2))
 
 	// both values should be there for both l1 and l2
@@ -359,7 +359,7 @@ func (s *DirSuite) TestCompaction(c *check.C) {
 	expectRecord(c, l2, "hello", []byte("world"), 1)
 	expectRecord(c, l2, "another", []byte("value"), 2)
 
-	c.Assert(filepath.Base(l2.file.Name()), check.Equals, secondLogFileName)
+	c.Assert(filepath.Base(l2.file.Name()), check.Equals, "1.lf")
 	c.Assert(l2.state.ProcessID, check.Equals, uint64(3))
 }
 

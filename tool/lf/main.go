@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"sync/atomic"
 	"syscall"
 	"text/tabwriter"
 	"time"
@@ -18,12 +19,18 @@ import (
 	"gopkg.in/alecthomas/kingpin.v2"
 )
 
+var debugMode int32
+
 func main() {
 	var exitCode int
 	var err error
 
 	if err = run(); err != nil {
-		fmt.Println(err.Error())
+		if atomic.LoadInt32(&debugMode) == 1 {
+			fmt.Println(trace.DebugReport(err))
+		} else {
+			fmt.Println(err.Error())
+		}
 		exitCode = 255
 	}
 	os.Exit(exitCode)
@@ -59,11 +66,12 @@ func run() error {
 		ccompact = app.Command("compact", "Compact database")
 		crepair  = app.Command("repair", "Repair database")
 
-		cbench         = app.Command("bench", "Run benchmark against database")
-		cbenchConfirm  = cbench.Flag("confirm", "Confirm").Default("false").Bool()
-		cbenchDuration = cbench.Flag("duration", "Benchmark duration").Default("10s").Duration()
-		cbenchThreads  = cbench.Flag("threads", "Concurrent threads to run").Default("10").Int()
-		cbenchRate     = cbench.Flag("rate", "Requests per second rate").Default("10").Int()
+		cbench                 = app.Command("bench", "Run benchmark against database")
+		cbenchConfirm          = cbench.Flag("confirm", "Confirm").Default("false").Bool()
+		cbenchDuration         = cbench.Flag("duration", "Benchmark duration").Default("10s").Duration()
+		cbenchThreads          = cbench.Flag("threads", "Concurrent threads to run").Default("10").Int()
+		cbenchRate             = cbench.Flag("rate", "Requests per second rate").Default("10").Int()
+		cbenchCompactionPeriod = cbench.Flag("compaction-period", "Compaction period to activate").Default("1s").Duration()
 	)
 
 	cmd, err := app.Parse(os.Args[1:])
@@ -73,6 +81,7 @@ func run() error {
 	}
 
 	if *debug {
+		atomic.StoreInt32(&debugMode, 1)
 		log.SetOutput(os.Stderr)
 		log.SetLevel(log.DebugLevel)
 	} else {
@@ -96,7 +105,7 @@ func run() error {
 	case crepair.FullCommand():
 		return repair(setupSignalHandlers(), *dir)
 	case cbench.FullCommand():
-		return bench(setupSignalHandlers(), *dir, *cbenchDuration, *cbenchThreads, *cbenchRate, *cbenchConfirm)
+		return bench(setupSignalHandlers(), *dir, *cbenchDuration, *cbenchThreads, *cbenchRate, *cbenchCompactionPeriod, *cbenchConfirm)
 	case cset.FullCommand():
 		var expires time.Time
 		if *csetTTL > 0 {
@@ -223,7 +232,7 @@ func watch(ctx context.Context, dir string, prefix string, recordID int64, onlyE
 	}
 	for {
 		err := watch()
-		if err == continueErr {
+		if err == continueErr || trace.IsNotFound(err) {
 			continue
 		}
 		return err
@@ -259,7 +268,7 @@ func repair(ctx context.Context, dir string) error {
 	return nil
 }
 
-func bench(ctx context.Context, dir string, duration time.Duration, threads, rate int, confirmed bool) error {
+func bench(ctx context.Context, dir string, duration time.Duration, threads, rate int, compactionPeriod time.Duration, confirmed bool) error {
 	if !confirmed {
 		return trace.BadParameter("'lf bench' is a dangerous operation and can overwrite existing data in %v, use 'lf bench --confirm' to proceed", dir)
 	}
@@ -268,10 +277,11 @@ func bench(ctx context.Context, dir string, duration time.Duration, threads, rat
 	start := time.Now().UTC()
 
 	result, err := RunBenchmark(ctx, Benchmark{
-		Dir:      dir,
-		Threads:  threads,
-		Rate:     rate,
-		Duration: duration,
+		Dir:              dir,
+		Threads:          threads,
+		Rate:             rate,
+		Duration:         duration,
+		CompactionPeriod: compactionPeriod,
 	})
 	if err != nil {
 		return trace.Wrap(err)

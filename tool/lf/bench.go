@@ -22,6 +22,8 @@ type Benchmark struct {
 	Rate int
 	// Duration is test duration
 	Duration time.Duration
+	// CompactionPeriod is a compaction period to activate
+	CompactionPeriod time.Duration
 }
 
 // BenchmarkResult is a result of the benchmark
@@ -41,8 +43,9 @@ func RunBenchmark(ctx context.Context, bench Benchmark) (*BenchmarkResult, error
 	defer cancel()
 
 	l, err := lf.NewDirLog(lf.DirLogConfig{
-		Context: ctx,
-		Dir:     bench.Dir,
+		Context:          ctx,
+		Dir:              bench.Dir,
+		CompactionPeriod: bench.CompactionPeriod,
 	})
 	if err != nil {
 		return nil, trace.Wrap(err)

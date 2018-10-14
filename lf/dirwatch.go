@@ -16,12 +16,12 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-// NewWatcher returns new watcher matching prefix,
+// newWatcher returns new watcher matching prefix,
 // if prefix is supplied, only events matching the prefix
 // will be returned, otherwise, all events will be returned
 // offset is optional and is used to locate the proper offset
 // if offset is nil, watch started from scratch
-func NewWatcher(cfg DirWatcherConfig) (*DirWatcher, error) {
+func newWatcher(cfg DirWatcherConfig) (*DirWatcher, error) {
 	if err := cfg.CheckAndSetDefaults(); err != nil {
 		return nil, trace.Wrap(err)
 	}

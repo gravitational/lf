@@ -30,10 +30,6 @@ const (
 const (
 	// stateFilename
 	stateFilename = "state"
-	// firstLogFileName
-	firstLogFileName = "first"
-	// secondLogFileName
-	secondLogFileName = "second"
 	// recordBatchSize is a batch up to 50 records
 	// to read in watcher (to avoid holding lock for a long time)
 	recordBatchSize = 50
@@ -110,15 +106,14 @@ func NewDirLog(cfg DirLogConfig) (*DirLog, error) {
 			trace.Component: componentLogFormat,
 		}),
 		DirLogConfig: cfg,
-		tree:         btree.New(cfg.BTreeDegree),
 		heap:         NewMinHeap(),
 		marshaler:    NewContainerMarshaler(),
 		cancel:       cancel,
 		ctx:          ctx,
-	}
-	d.pool = &sync.Pool{
-		New: func() interface{} {
-			return make([]byte, ContainerSizeBytes)
+		pool: &sync.Pool{
+			New: func() interface{} {
+				return make([]byte, ContainerSizeBytes)
+			},
 		},
 	}
 
@@ -131,8 +126,26 @@ func NewDirLog(cfg DirLogConfig) (*DirLog, error) {
 			return nil, trace.Wrap(err)
 		}
 	}
-	if err := d.readFull(); err != nil {
-		return nil, trace.Wrap(err)
+reopenloop:
+	// try 10 times to open the database that could have been compacted
+	// while this code tried to open it
+	for i := 0; i < 10; i++ {
+		err := d.readFull()
+		switch {
+		case err == nil:
+			break reopenloop
+		case IsReopenDatabaseError(err):
+			if err := d.reopen(); err != nil {
+				if !IsReopenDatabaseError(err) {
+					d.Debugf("Failed to reopen: %v", err)
+					d.closeWithoutLock()
+					return nil, trace.Wrap(err)
+				}
+			}
+		default:
+			d.closeWithoutLock()
+			return nil, trace.Wrap(err)
+		}
 	}
 
 	if !d.CompactionsDisabled {
@@ -175,7 +188,9 @@ type DirLog struct {
 // will be returned, otherwise, all events will be returned
 // offset is optional and is used to locate the proper offset
 func (d *DirLog) NewWatcher(prefix []byte, offset *Offset) (*DirWatcher, error) {
-	return NewWatcher(DirWatcherConfig{
+	d.Lock()
+	defer d.Unlock()
+	return newWatcher(DirWatcherConfig{
 		Dir:        d,
 		Prefix:     prefix,
 		Offset:     offset,
@@ -207,11 +222,12 @@ compactloop:
 				if err == nil {
 					continue compactloop
 				}
-				d.Debugf("Compact and reopen failed: %v, will retry: %v.", err)
+				d.Debugf("Compact and reopen failed: %v, will retry in %v.", err, time.Second)
 				retryChannel = retryTicker.C
 			}
 		case <-d.ctx.Done():
 			d.Debugf("DirLog is closing, returning.")
+			return
 		}
 	}
 }
@@ -254,18 +270,31 @@ func (d *DirLog) Compact(ctx context.Context) error {
 	}
 }
 
+func (d *DirLog) reopen() error {
+	if err := d.closeWithoutLock(); err != nil {
+		return trace.Wrap(err)
+	}
+	// what happens here if failed to open?
+	if err := d.open(); err != nil {
+		return trace.Wrap(err)
+	}
+	return nil
+}
+
 // tryCompactAndReopen tries to compact the database,
 // if it succeeds, it will reopen the database
 func (d *DirLog) tryCompactAndReopen(ctx context.Context) error {
 	d.Lock()
 	defer d.Unlock()
 	if err := d.tryCompact(ctx, false); err != nil {
+		if IsReopenDatabaseError(err) {
+			if err := d.reopen(); err != nil {
+				return trace.Wrap(err)
+			}
+		}
 		return trace.Wrap(err)
 	}
-	if err := d.closeWithoutLock(); err != nil {
-		return trace.Wrap(err)
-	}
-	return d.open()
+	return d.reopen()
 }
 
 // tryRepairAndReopen, will attempt to repair the database
@@ -274,12 +303,14 @@ func (d *DirLog) tryRepairAndReopen(ctx context.Context) error {
 	d.Lock()
 	defer d.Unlock()
 	if err := d.tryCompact(ctx, true); err != nil {
+		if IsReopenDatabaseError(err) {
+			if err := d.reopen(); err != nil {
+				return trace.Wrap(err)
+			}
+		}
 		return trace.Wrap(err)
 	}
-	if err := d.closeWithoutLock(); err != nil {
-		return trace.Wrap(err)
-	}
-	return d.open()
+	return d.reopen()
 }
 
 // tryCompact attempts to grab locks and compact files
@@ -299,25 +330,32 @@ func (d *DirLog) tryCompact(ctx context.Context, repair bool) error {
 	}
 	defer fs.Unlock(stateFile)
 
-	firstFile, err := os.OpenFile(filepath.Join(d.Dir, firstLogFileName), os.O_RDWR|os.O_CREATE, 0600)
+	state, err := d.readState(stateFile)
 	if err != nil {
-		return trace.ConvertSystemError(err)
-	}
-	defer firstFile.Close()
-	if err := fs.TryWriteLock(firstFile); err != nil {
 		return trace.Wrap(err)
 	}
-	defer fs.Unlock(firstFile)
 
-	secondFile, err := os.OpenFile(filepath.Join(d.Dir, secondLogFileName), os.O_RDWR|os.O_CREATE, 0600)
+	// check if state file and currently opened state is obsolete
+	if state.LogID != d.state.LogID {
+		d.Debugf("State file has been changed. Cancelling compaction, reopen the database.")
+		return &ReopenDatabaseError{}
+	}
+
+	// write lock the currently active file
+	if err := fs.TryWriteLock(d.file); err != nil {
+		return trace.Wrap(err)
+	}
+	defer fs.Unlock(d.file)
+
+	nextFile, err := os.OpenFile(filepath.Join(d.Dir, logFilename(state.LogID+1)), os.O_RDWR|os.O_CREATE, 0600)
 	if err != nil {
 		return trace.ConvertSystemError(err)
 	}
-	defer secondFile.Close()
-	if err := fs.TryWriteLock(secondFile); err != nil {
+	defer nextFile.Close()
+	if err := fs.TryWriteLock(nextFile); err != nil {
 		return trace.Wrap(err)
 	}
-	defer fs.Unlock(secondFile)
+	defer fs.Unlock(nextFile)
 
 	// 2. catch up on all latest reads
 	err = d.readAll(readParams{
@@ -333,21 +371,13 @@ func (d *DirLog) tryCompact(ctx context.Context, repair bool) error {
 
 	d.removeExpired()
 
-	// 3. write the compacted version of the data to the non-current file
-	var compactedFile *os.File
-	if filepath.Base(d.file.Name()) == firstLogFileName {
-		compactedFile = secondFile
-	} else {
-		compactedFile = firstFile
-	}
-	if err := compactedFile.Truncate(0); err != nil {
-		return trace.Wrap(err)
-	}
+	// 3. write the compacted version of the data to the next version of the log file
+	d.Debugf("%v %v Write next %v.", time.Now().UTC(), os.Getpid(), nextFile.Name())
 
 	newState := walpb.State{
 		SchemaVersion: V1,
 		ProcessID:     1,
-		CurrentFile:   filepath.Base(compactedFile.Name()),
+		LogID:         state.LogID + 1,
 	}
 
 	var items []Item
@@ -369,7 +399,7 @@ func (d *DirLog) tryCompact(ctx context.Context, repair bool) error {
 		if repair {
 			useID = newID
 		}
-		_, err := d.appendRecord(compactedFile, newState.ProcessID, useID, r)
+		_, err := d.appendRecord(nextFile, newState.ProcessID, useID, r)
 		if err != nil {
 			return trace.Wrap(err)
 		}
@@ -389,6 +419,13 @@ func (d *DirLog) tryCompact(ctx context.Context, repair bool) error {
 	err = d.writeState(stateFile, &newState)
 	if err != nil {
 		return trace.Wrap(err)
+	}
+
+	// 6. Remove currently opened file,
+	// this will not affect ability of other processes to read it,
+	// they should see the new "reopen" record and reopen the database
+	if err := os.Remove(d.file.Name()); err != nil {
+		return trace.ConvertSystemError(err)
 	}
 
 	return nil
@@ -415,6 +452,37 @@ func (d *DirLog) writeState(f *os.File, state *walpb.State) error {
 		return trace.Wrap(err)
 	}
 	return nil
+}
+
+// readState reads the state file and rewinds the pointer
+// in case of success
+func (d *DirLog) readState(f *os.File) (*walpb.State, error) {
+	bytes, err := ioutil.ReadAll(f)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	var state walpb.State
+	if len(bytes) == 0 {
+		return nil, trace.NotFound("state file is empty")
+	}
+	data, err := ContainerUnmarshal(bytes)
+	if err != nil {
+		return nil, trace.Wrap(err)
+	}
+	if err := state.Unmarshal(data); err != nil {
+		return nil, trace.Wrap(err)
+	}
+	if state.ProcessID == math.MaxUint64 {
+		return nil, trace.Wrap(&CompactionRequiredError{})
+	}
+	if state.LogID == math.MaxUint64 {
+		return nil, trace.Wrap(&CompactionRequiredError{})
+	}
+	_, err = f.Seek(0, 0)
+	if err != nil {
+		return nil, trace.ConvertSystemError(err)
+	}
+	return &state, nil
 }
 
 // initOrUpdateState makes sure the monotonically increasing process id
@@ -450,7 +518,7 @@ func (d *DirLog) initOrUpdateState() (*walpb.State, error) {
 		}
 	} else {
 		state.ProcessID = 0
-		state.CurrentFile = firstLogFileName
+		state.LogID = 0
 		state.SchemaVersion = V1
 	}
 	state.ProcessID += 1
@@ -460,6 +528,10 @@ func (d *DirLog) initOrUpdateState() (*walpb.State, error) {
 	return &state, nil
 }
 
+func logFilename(logID uint64) string {
+	return fmt.Sprintf("%v.lf", logID)
+}
+
 // open opens database and inits internal state
 func (d *DirLog) open() error {
 	state, err := d.initOrUpdateState()
@@ -467,11 +539,13 @@ func (d *DirLog) open() error {
 		return trace.Wrap(err)
 	}
 	d.state = *state
-	f, err := os.OpenFile(filepath.Join(d.Dir, d.state.CurrentFile), os.O_RDWR|os.O_CREATE, 0600)
+	f, err := os.OpenFile(filepath.Join(d.Dir, logFilename(d.state.LogID)), os.O_RDWR|os.O_CREATE, 0600)
 	if err != nil {
 		return trace.ConvertSystemError(err)
 	}
 	d.file = f
+	d.tree = btree.New(d.BTreeDegree)
+	d.Debugf("%v %v Open file %v.", time.Now().UTC(), os.Getpid(), d.file.Name())
 	return nil
 }
 
@@ -493,24 +567,22 @@ func (d *DirLog) closeWithoutLock() error {
 
 func (d *DirLog) newReader(f *os.File, repair bool) reader {
 	srcBuffer := d.pool.Get().([]byte)
-	defer d.pool.Put(zero(srcBuffer))
-
 	dstBuffer := d.pool.Get().([]byte)
-	defer d.pool.Put(zero(dstBuffer))
-
 	if repair {
 		return &repairReader{
-			file:      f,
-			srcBuffer: srcBuffer,
+			pool:      d.pool,
 			dstBuffer: dstBuffer,
+			srcBuffer: srcBuffer,
+			file:      f,
 			records:   &repairMarshaler{},
 			marshaler: d.marshaler,
 		}
 	}
 	return &strictReader{
-		file:      f,
-		srcBuffer: srcBuffer,
+		pool:      d.pool,
 		dstBuffer: dstBuffer,
+		srcBuffer: srcBuffer,
+		file:      f,
 		records:   &recordMarshaler{},
 		marshaler: d.marshaler,
 	}
@@ -635,6 +707,7 @@ type readParams struct {
 // in case if limit is > 0, up to limit records io.EOF is returned at the end of read
 func (d *DirLog) read(p readParams) error {
 	reader := d.newReader(p.file, p.repair)
+	defer reader.Close()
 	count := 0
 	for {
 		record, err := reader.next()
@@ -739,10 +812,7 @@ func (d *DirLog) CompareAndSwap(expected Item, replaceWith Item) error {
 		if !IsReopenDatabaseError(err) {
 			return trace.Wrap(err)
 		}
-		if err := d.closeWithoutLock(); err != nil {
-			return trace.Wrap(err)
-		}
-		if err := d.open(); err != nil {
+		if err := d.reopen(); err != nil {
 			return trace.Wrap(err)
 		}
 		if result, err = d.tryGetNoLock(expected.Key, Range{}); err != nil {
@@ -816,10 +886,8 @@ func (d *DirLog) GetRange(key []byte, r Range) (*GetResult, error) {
 		if !IsReopenDatabaseError(err) {
 			return nil, trace.Wrap(err)
 		}
-		if err := d.closeWithoutLock(); err != nil {
-			return nil, trace.Wrap(err)
-		}
-		if err := d.open(); err != nil {
+		d.Debugf("%v %v Reopen, current (%v).", time.Now().UTC(), os.Getpid(), d.file.Name())
+		if err := d.reopen(); err != nil {
 			return nil, trace.Wrap(err)
 		}
 		return d.tryGet(key, r)
@@ -900,10 +968,8 @@ func (d *DirLog) Append(r Record) error {
 		if !IsReopenDatabaseError(err) {
 			return trace.Wrap(err)
 		}
-		if err := d.closeWithoutLock(); err != nil {
-			return trace.Wrap(err)
-		}
-		if err := d.open(); err != nil {
+		d.Debugf("%v %v Reopen, current (%v).", time.Now().UTC(), os.Getpid(), d.file.Name())
+		if err := d.reopen(); err != nil {
 			return trace.Wrap(err)
 		}
 		return d.tryAppend(r)
@@ -1122,14 +1188,23 @@ type reader interface {
 	// next returns the next record from the
 	// wal log
 	next() (*walpb.Record, error)
+	// Close releases buffers back to pool
+	Close() error
 }
 
 type strictReader struct {
+	pool      *sync.Pool
 	file      *os.File
 	srcBuffer []byte
 	dstBuffer []byte
 	records   *recordMarshaler
 	marshaler *ContainerMarshaler
+}
+
+func (r *strictReader) Close() error {
+	r.pool.Put(zero(r.srcBuffer))
+	r.pool.Put(zero(r.dstBuffer))
+	return nil
 }
 
 // next returns full record or error otherwise,
@@ -1238,11 +1313,18 @@ func (m *repairMarshaler) accept(data []byte) error {
 }
 
 type repairReader struct {
+	pool      *sync.Pool
 	file      *os.File
 	srcBuffer []byte
 	dstBuffer []byte
 	records   *repairMarshaler
 	marshaler *ContainerMarshaler
+}
+
+func (r *repairReader) Close() error {
+	r.pool.Put(zero(r.srcBuffer))
+	r.pool.Put(zero(r.dstBuffer))
+	return nil
 }
 
 // next returns full record or error otherwise,

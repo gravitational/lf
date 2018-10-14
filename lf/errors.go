@@ -16,7 +16,7 @@ type ChecksumError struct {
 
 // Error returns a formatted user-friendly message
 func (e ChecksumError) Error() string {
-	return fmt.Sprintf("checksum mismatch, expected checksum %v != computed checksum %v",
+	return fmt.Sprintf("checksum mismatch, expected checksum %v != computed checksum %v for container",
 		e.ExpectedChecksum, e.ComputedChecksum)
 }
 
